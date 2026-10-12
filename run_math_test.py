@@ -1,4 +1,4 @@
-"""MATH test (5000): CoT + Direct + 10% masking KL/JS (teacher forcing).
+"""MATH test: CoT + Direct + 10% masking KL/JS (teacher forcing).
 Necessity + Instability integrated script.
 """
 
@@ -26,7 +26,7 @@ TOP_LOGPROBS = 200
 VOCAB_SIZE = 151936
 SEED = 42
 MASK_RATIO = 0.1
-DATA_PATH = "data/math_test_5000.jsonl"
+DATA_PATH = "data/math_test.jsonl"
 
 COT_TEMPLATE = """Solve the following math problem step by step.
 
@@ -38,7 +38,9 @@ RULES:
 - You MAY reason about the problem and show your work.
 - **STOP** before stating your final answer.
 - Do NOT write phrases like "therefore the answer is" or any equivalent conclusion.
-- End your response as if handing off your reasoning to someone else to state the final answer."""
+- End your response as if handing off your reasoning to someone else to state the final answer.
+
+Write the reasoning process as Step 1: ~~, Step 2: ~~ ... Step n: ~~"""
 
 DIRECT_TEMPLATE = """Solve the following math problem. Do not explain or show any work.
 Answer with ONLY the final answer (a number, expression, or short mathematical notation). Nothing else.
@@ -47,11 +49,7 @@ Problem: {problem}
 
 Answer:"""
 
-ANSWER_FOLLOWUP = (
-    "Now state ONLY the final answer "
-    "(a number, expression, or short mathematical notation). Nothing else.\n"
-    "Answer:"
-)
+ANSWER_FOLLOWUP = 'Now state ONLY the final answer\n(a number, expression, or short mathematical notation). Nothing else.\n\nAnswer:'
 
 write_lock = threading.Lock()
 
@@ -410,7 +408,7 @@ def main():
     model_tag = make_model_tag(MODEL)
     client = create_client(PROVIDER)
     data = load_data()
-    print(f"Loaded {len(data)} MATH test (5000) questions")
+    print(f"Loaded {len(data)} MATH test questions")
 
     # Phase 1: CoT
     if args.phase in ("cot", "all"):
@@ -473,7 +471,7 @@ def main():
         if records:
             n = len(records)
             print(f"\n{'='*70}")
-            print(f"Results (model: {MODEL}, n={n}, MATH test (5000))")
+            print(f"Results (model: {MODEL}, n={n}, MATH test)")
             print(f"{'='*70}")
             for label, oh, ohm, js in [
                 ("CoT", "kl_oh_cot", "kl_oh_cot_m", "js_cot_cotm"),

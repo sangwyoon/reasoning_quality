@@ -1,4 +1,4 @@
-"""MMLU full (14,042 questions): CoT + Direct + 10% masking KL/JS.
+"""MMLU full: CoT + Direct + 10% masking KL/JS.
 4-choice MCQ (A-D). Necessity + Instability integrated script.
 """
 
@@ -37,9 +37,11 @@ C. {choice_C}
 D. {choice_D}
 
 Think step by step, analyzing the logic behind each option.
+Write the reasoning process as Step 1: ~~, Step 2: ~~ ... Step n: ~~
 
 RULES:
 - You MAY reason about which options are more or less plausible, and why.
+- You MAY state, in theory, what the correct concept or principle is.
 - **STOP** before explicitly selecting or labeling any option as the final answer.
 - Do NOT write phrases like "therefore the answer is", "the correct option is", "this matches option X", or any equivalent conclusion that names a letter as the answer.
 - End your response as if handing off your reasoning to someone else to make the final selection."""
@@ -55,7 +57,7 @@ D. {choice_D}
 Do not explain or reason. Answer with only a single letter (A, B, C, or D).
 The answer is"""
 
-ANSWER_FOLLOWUP = "Based on the reasoning above, answer with only a single letter (A, B, C, or D). Do NOT add any additional reasoning, explanation, or modification to the reasoning above. Simply output the final answer. The answer is"
+ANSWER_FOLLOWUP = 'Now answer with only a single letter (A, B, C, or D). The answer is'
 
 write_lock = threading.Lock()
 

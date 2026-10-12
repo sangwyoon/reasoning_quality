@@ -27,7 +27,7 @@ VOCAB_SIZE = 151936
 SEED = 42
 MASK_RATIO = 0.1
 THINKING_MODEL = False
-DATA_PATH = "data/math_test_5000.jsonl"
+DATA_PATH = "data/math_test.jsonl"
 
 COT_TEMPLATE = """Solve the following math problem step by step.
 
@@ -39,7 +39,9 @@ RULES:
 - You MAY reason about the problem and show your work.
 - **STOP** before stating your final answer.
 - Do NOT write phrases like "therefore the answer is" or any equivalent conclusion.
-- End your response as if handing off your reasoning to someone else to state the final answer."""
+- End your response as if handing off your reasoning to someone else to state the final answer.
+
+Write the reasoning process as Step 1: ~~, Step 2: ~~ ... Step n: ~~"""
 
 DIRECT_TEMPLATE = """Solve the following math problem. Do not explain or show any work.
 Answer with ONLY the final answer (a number, expression, or short mathematical notation). Nothing else.
@@ -48,11 +50,7 @@ Problem: {problem}
 
 Answer:"""
 
-ANSWER_FOLLOWUP = (
-    "Now state ONLY the final answer "
-    "(a number, expression, or short mathematical notation). Nothing else.\n"
-    "Answer:"
-)
+ANSWER_FOLLOWUP = 'Now state ONLY the final answer\n(a number, expression, or short mathematical notation). Nothing else.\n\nAnswer:'
 
 write_lock = threading.Lock()
 
