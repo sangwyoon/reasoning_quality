@@ -1,2 +1,2 @@
 # reasoning_quality
-Is It Necessary and Robust? Decomposing LLM's Reasoning Quality
+Reasoning Is Most Fragile When It Matters Most
