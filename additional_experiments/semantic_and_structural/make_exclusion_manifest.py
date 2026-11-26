@@ -4,12 +4,14 @@ from collections import OrderedDict
 
 DATASETS = ("gsm8k", "math_t", "omni", "gpqa", "mmlu", "agie", "mmlupro")
 
-def uids(path_glob):
+def uids(path_glob, successful_only=False):
     ids = set()
     for fp in glob.glob(path_glob):
         for line in open(fp):
             try:
-                ids.add(json.loads(line)["question_id"])
+                record = json.loads(line)
+                if not (successful_only and record.get("error") is not None):
+                    ids.add(record["question_id"])
             except Exception:
                 pass
     return ids
@@ -41,7 +43,7 @@ for cot_dir, name, ds in cot_dirs:
         d = f"{BASE}/{dpre}_{ds}_{tag}"
         if not os.path.isdir(d):
             continue
-        present = uids(f"{d}/*.jsonl")
+        present = uids(f"{d}/*.jsonl", successful_only=True)
         excluded = sorted(cot_ids - present, key=lambda q: (len(q), q))
         if excluded:
             manifest[f"{phase}/{ds}/{tag}"] = {

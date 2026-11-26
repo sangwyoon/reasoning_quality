@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from llm_client import create_client, make_model_tag
 import measures
+import vllm_server
 from paraphrase import split_reasoning_into_steps
 
 load_dotenv()
@@ -22,7 +23,7 @@ MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROVIDER = "vllm"
 MAX_WORKERS = 8
 TOP_LOGPROBS = 200
-VOCAB_SIZE = 151936
+VOCAB_SIZE = None
 DATA_PATH = "data/math_test.jsonl"
 SEED = 42
 
@@ -91,28 +92,9 @@ def load_cot_results(model_tag):
     return cot_map
 
 
-def vllm_tokenize(text):
-    import os, requests
-    base_url = os.environ.get("VLLM_API_BASE", "http://localhost:8000/v1")
-    base = base_url.rstrip("/v1").rstrip("/")
-    resp = requests.post(f"{base}/tokenize", json={"prompt": text, "add_special_tokens": False}, timeout=10)
-    return resp.json().get("tokens", [])
-
-
-def vllm_detokenize(token_ids):
-    import os, requests
-    base_url = os.environ.get("VLLM_API_BASE", "http://localhost:8000/v1")
-    base = base_url.rstrip("/v1").rstrip("/")
-    results = []
-    for tid in token_ids:
-        resp = requests.post(f"{base}/detokenize", json={"tokens": [tid]}, timeout=10)
-        results.append(resp.json().get("prompt", ""))
-    return results
-
-
 def extract_distribution(logprobs_content):
     if not logprobs_content:
-        return {}, 0.0
+        raise ValueError("empty logprobs content")
     token_info = logprobs_content[0]
     dist = {}
     prob_mass = 0.0
@@ -161,14 +143,7 @@ def teacher_force_distribution(client, messages, correct_answer):
         return []
 
     if PROVIDER == "vllm":
-        try:
-            token_ids = vllm_tokenize(answer_text)
-            correct_tokens = vllm_detokenize(token_ids)
-        except Exception:
-            from llm_client import get_tokenizer
-            enc = get_tokenizer(MODEL)
-            token_ids = enc.encode(answer_text)
-            correct_tokens = [enc.decode([tid]) for tid in token_ids]
+        correct_tokens = vllm_server.detokenize(MODEL, vllm_server.tokenize(MODEL, answer_text))
     else:
         from llm_client import get_tokenizer
         enc = get_tokenizer(MODEL)
@@ -254,7 +229,7 @@ def _compute_item(client, row, idx, output_path, cot_record):
     correct_answer = extract_boxed_answer(row["solution"])
 
     if not correct_answer.strip():
-        return None
+        raise ValueError("empty gold answer")
 
     reasoning = cot_record.get("reasoning", "")
     if cot_record.get("error") is not None or not reasoning:
@@ -288,7 +263,7 @@ def _compute_item(client, row, idx, output_path, cot_record):
     direct_results = teacher_force_distribution(client, direct_messages, correct_answer)
 
     if not cot_results or not dup_results or not direct_results:
-        return None
+        raise ValueError("no teacher-forcing tokens")
 
     n_tokens = min(len(cot_results), len(dup_results), len(direct_results))
 
@@ -344,17 +319,19 @@ def main():
     parser.add_argument("--provider", type=str, choices=["openai", "litellm", "vllm"], default="vllm")
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--top_logprobs", type=int, default=200)
+    parser.add_argument("--vocab_size", type=int, default=None)
     args = parser.parse_args()
 
     if args.model:
         global MODEL
         MODEL = args.model
-    global PROVIDER, TOP_LOGPROBS
+    global PROVIDER, TOP_LOGPROBS, VOCAB_SIZE
     PROVIDER = args.provider
     if args.workers:
         global MAX_WORKERS
         MAX_WORKERS = args.workers
     TOP_LOGPROBS = args.top_logprobs
+    VOCAB_SIZE = measures.resolve_vocab_size(MODEL, args.vocab_size)
 
     model_tag = make_model_tag(MODEL)
     client = create_client(PROVIDER)
@@ -370,7 +347,7 @@ def main():
     output_path = output_dir / "kl_dupstep.jsonl"
     measures.write_run_config(
         output_path, model=MODEL, dataset="math_test", phase="kl_dupstep", seed=SEED,
-        mask_ratio=None, n_probes=1, top_logprobs=TOP_LOGPROBS)
+        mask_ratio=None, n_probes=1, top_logprobs=TOP_LOGPROBS, vocab_size=VOCAB_SIZE)
 
     data = load_data()
     completed_ids = load_completed_ids(output_path)

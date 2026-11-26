@@ -121,7 +121,7 @@ def test_runner_end_to_end_with_failure_and_resume(tmp_path):
     for k in ("matched_template", "filler", "shuffled", "direct"):
         assert by["q0"]["necessity"][f"necessity_vs_{k}"] == pytest.approx(math.log(0.7 / 0.4), abs=1e-6)
     c = by["q0"]["conditions"]["trace"]
-    assert set(c["info"]) == {"choice_mass_observed", "n_missing", "tail_mass"}
+    assert set(c["info"]) == {"choice_mass_observed", "n_missing", "tail_mass", "first_token"}
     # injected failure: only the direct condition for q1, no fabricated numbers
     assert by["q1"]["error"] is not None
     d = by["q1"]["conditions"]["direct"]

@@ -164,6 +164,7 @@ def process_cot(client, row, idx, output_path):
         "subject": row["subject"],
         "ground_truth": ground_truth,
         "predicted": predicted,
+        "first_token": mc_info.get("first_token"),
         "correct_token_prob": correct_prob,
         "top_probs": probs,
         "choice_mass_observed": mc_info.get("choice_mass_observed"),
@@ -206,6 +207,7 @@ def process_direct(client, row, idx, output_path):
         "subject": row["subject"],
         "ground_truth": ground_truth,
         "predicted": predicted,
+        "first_token": mc_info.get("first_token"),
         "correct_token_prob": correct_prob,
         "top_probs": probs,
         "choice_mass_observed": mc_info.get("choice_mass_observed"),
@@ -238,6 +240,21 @@ def duplicate_step(reasoning, seed_str):
     new_steps = list(steps)
     new_steps.insert(idx + 1, steps[idx])
     return "\n\n".join(new_steps), idx
+
+
+KL_METRIC_KEYS = ("is_cot_correct", "kl_oh_cot", "kl_oh_cot_m", "js_cot_cotm", "kl_oh_dup",
+                  "kl_oh_dup_m", "js_dup_dupm", "kl_oh_sm", "kl_oh_sm_m", "js_sm_smm")
+
+
+def write_error_record(output_path, question_id, ground_truth, condition):
+    """Store a record with ``error`` and empty metrics for an item whose request failed."""
+    record = {"question_id": question_id, "ground_truth": ground_truth,
+              "error": f"answer distribution failed for condition {condition!r}"}
+    record.update({k: None for k in KL_METRIC_KEYS})
+    with write_lock:
+        with open(output_path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record
 
 
 def process_kl(client, row, idx, output_path, cot_rec):
@@ -273,7 +290,7 @@ def process_kl(client, row, idx, output_path, cot_rec):
             {"role": "user", "content": ANSWER_FOLLOWUP},
         ], question_id)
         if res is None:
-            return None
+            return write_error_record(output_path, question_id, ground_truth, name)
         dists[name], infos[name] = res
 
     def compute(o, m):
@@ -396,6 +413,7 @@ def main():
         with open(kl_path) as f:
             for line in f:
                 records.append(json.loads(line))
+        records = [r for r in records if r.get("error") is None]
         if records:
             n = len(records)
             print(f"\n{'='*70}")

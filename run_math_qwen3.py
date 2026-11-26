@@ -19,6 +19,7 @@ from llm_client import create_client, make_model_tag, get_tokenizer
 from paraphrase import split_reasoning_into_steps, TokenMasker, remove_one_step
 
 import measures
+import vllm_server
 
 load_dotenv()
 
@@ -26,10 +27,10 @@ MODEL = "Qwen/Qwen3-0.6B"
 PROVIDER = "vllm"
 MAX_WORKERS = 8
 TOP_LOGPROBS = 200
-VOCAB_SIZE = 151936
+VOCAB_SIZE = None
 SEED = 42
 MASK_RATIO = 0.1
-JUDGE = None
+JUDGE = measures.openai_judge(measures.DEFAULT_JUDGE_MODEL)
 THINKING_MODEL = False
 DATA_PATH = "data/math_test.jsonl"
 
@@ -77,22 +78,6 @@ def extract_boxed_answer(solution):
     return matches[-1] if matches else ""
 
 
-def vllm_tokenize(text):
-    import os, requests
-    base = os.environ.get("VLLM_API_BASE", "http://localhost:8000/v1").rstrip("/v1").rstrip("/")
-    return requests.post(f"{base}/tokenize", json={"model": MODEL, "prompt": text}, timeout=10).json().get("tokens", [])
-
-
-def vllm_detokenize(token_ids):
-    import os, requests
-    base = os.environ.get("VLLM_API_BASE", "http://localhost:8000/v1").rstrip("/v1").rstrip("/")
-    results = []
-    for tid in token_ids:
-        resp = requests.post(f"{base}/detokenize", json={"model": MODEL, "tokens": [tid]}, timeout=10).json()
-        results.append(resp.get("prompt", ""))
-    return results
-
-
 def extract_distribution(logprobs_content):
     if not logprobs_content:
         raise ValueError("empty logprobs")
@@ -137,13 +122,7 @@ def teacher_force(client, messages, correct_answer):
     if not answer_text:
         return []
     if PROVIDER == "vllm":
-        try:
-            tids = vllm_tokenize(answer_text)
-            tokens = vllm_detokenize(tids)
-        except Exception:
-            enc = get_tokenizer(MODEL)
-            tids = enc.encode(answer_text)
-            tokens = [enc.decode([t]) for t in tids]
+        tokens = vllm_server.detokenize(MODEL, vllm_server.tokenize(MODEL, answer_text))
     else:
         enc = get_tokenizer(MODEL)
         tids = enc.encode(answer_text)
@@ -193,7 +172,7 @@ def teacher_force(client, messages, correct_answer):
 
 def compute_avg_token_prob(logprobs_content):
     if not logprobs_content:
-        return 0.0
+        raise ValueError("empty logprobs content")
     return sum(math.exp(tok.logprob) for tok in logprobs_content) / len(logprobs_content)
 
 
@@ -255,10 +234,10 @@ def process_cot(client, row, idx, output_path):
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": reasoning},
                 {"role": "user", "content": ANSWER_FOLLOWUP},
-            ], temperature=0, max_tokens=256, logprobs=True, top_logprobs=TOP_LOGPROBS,
+            ], temperature=0, max_tokens=100, logprobs=True, top_logprobs=TOP_LOGPROBS,
             **({} if not _extra_body(False) else {"extra_body": _extra_body(False)}))
         generated_answer = resp2.choices[0].message.content.strip() if resp2.choices[0].message.content else ""
-        generated_prob = compute_avg_token_prob(resp2.choices[0].logprobs.content) if resp2.choices[0].logprobs else 0.0
+        generated_prob = compute_avg_token_prob(resp2.choices[0].logprobs.content)
 
         tf_results = teacher_force(client, [
             {"role": "user", "content": prompt},
@@ -272,7 +251,8 @@ def process_cot(client, row, idx, output_path):
         else:
             correct_prob = None
             correct_tail_mass = None
-        is_correct, is_correct_method = measures.match_answers(correct_answer, generated_answer, JUDGE)
+        is_correct = measures.judge_correct(correct_answer, generated_answer, JUDGE)
+        is_correct_method = "judge" if JUDGE else "exact_numeric"
 
     except Exception as e:
         print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
@@ -345,7 +325,8 @@ def process_kl(client, row, idx, output_path, cot_rec):
     question_id = f"math_{idx}"
     correct_answer = row.get("answer", extract_boxed_answer(row.get("solution", "")))
     if not correct_answer.strip():
-        return None
+        return write_error_record(output_path, question_id, correct_answer,
+                                  ValueError("empty gold answer"), KL_METRIC_KEYS)
     reasoning = cot_rec.get("reasoning", "")
     if cot_rec.get("error") is not None or not reasoning:
         return None
@@ -376,7 +357,8 @@ def process_kl(client, row, idx, output_path, cot_rec):
 
     min_tokens = min((len(r) for r in tf.values() if r), default=0)
     if min_tokens == 0:
-        return None
+        return write_error_record(output_path, question_id, correct_answer,
+                                  ValueError("no teacher-forcing tokens"), KL_METRIC_KEYS)
 
     def compute(o, m):
         kl_o, kl_m, js_vals = [], [], []
@@ -421,24 +403,23 @@ def main():
     parser.add_argument("--phase", choices=["cot", "direct", "kl", "all"], default="all")
     parser.add_argument("--thinking-model", action="store_true")
     parser.add_argument("--top_logprobs", type=int, default=200)
-    parser.add_argument("--judge_model", type=str, default=None,
-                        help="OpenAI model used as an equivalence judge when exact/numeric match is undecided (default: no judge)")
+    parser.add_argument("--vocab_size", type=int, default=None)
+    measures.add_judge_argument(parser)
     args = parser.parse_args()
 
     if args.model:
         global MODEL
         MODEL = args.model
-    global PROVIDER, THINKING_MODEL, TOP_LOGPROBS
+    global PROVIDER, THINKING_MODEL, TOP_LOGPROBS, VOCAB_SIZE
     PROVIDER = args.provider
     global JUDGE
-    if args.judge_model:
-        from openai import OpenAI
-        JUDGE = measures.make_judge(OpenAI(), args.judge_model)
+    JUDGE = measures.openai_judge(args.judge_model)
     if args.workers:
         global MAX_WORKERS
         MAX_WORKERS = args.workers
     THINKING_MODEL = args.thinking_model
     TOP_LOGPROBS = args.top_logprobs
+    VOCAB_SIZE = measures.resolve_vocab_size(MODEL, args.vocab_size)
 
     model_tag = make_model_tag(MODEL)
     client = create_client(PROVIDER)
@@ -453,7 +434,7 @@ def main():
         p = d / "math.jsonl"
         measures.write_run_config(
             p, model=MODEL, dataset="math", phase="cot", seed=SEED,
-            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS,
+            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS, vocab_size=VOCAB_SIZE,
             judge_model=args.judge_model)
         done = load_completed_ids(p)
         pending = [(i, r) for i, r in enumerate(data) if f"math_{i}" not in done]
@@ -470,7 +451,7 @@ def main():
         p = d / "kl_direct.jsonl"
         measures.write_run_config(
             p, model=MODEL, dataset="math", phase="direct", seed=SEED,
-            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS,
+            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS, vocab_size=VOCAB_SIZE,
             judge_model=args.judge_model)
         done = load_completed_ids(p)
         pending = [(i, r) for i, r in enumerate(data) if f"math_{i}" not in done]
@@ -497,7 +478,7 @@ def main():
         p = d / "kl_mask10.jsonl"
         measures.write_run_config(
             p, model=MODEL, dataset="math", phase="kl", seed=SEED,
-            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS,
+            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS, vocab_size=VOCAB_SIZE,
             judge_model=args.judge_model)
         done = load_completed_ids(p)
         pending = [(i, r, cot_map[f"math_{i}"]) for i, r in enumerate(data)
@@ -511,7 +492,7 @@ def main():
 
         records = []
         with open(p) as f:
-            records = [json.loads(l) for l in f]
+            records = [r for r in map(json.loads, f) if r.get("error") is None]
         if records:
             n = len(records)
             print(f"\n{'='*70}")

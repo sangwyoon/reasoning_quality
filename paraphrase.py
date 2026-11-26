@@ -258,22 +258,22 @@ class LLMParaphraser:
 
         Returns:
             (paraphrased_text, ["llm_paraphrase"])
+
+        Raises on a failed request or empty output.
         """
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.7,
-                max_tokens=2048,
-            )
-            paraphrased = resp.choices[0].message.content.strip()
-            return paraphrased, ["llm_paraphrase"]
-        except Exception as e:
-            # Return original text on failure
-            return text, [f"llm_error:{str(e)[:100]}"]
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+            max_tokens=2048,
+        )
+        paraphrased = (resp.choices[0].message.content or "").strip()
+        if not paraphrased:
+            raise RuntimeError("paraphraser returned empty output")
+        return paraphrased, ["llm_paraphrase"]
 
 
 # ---------------------------------------------------------------------------

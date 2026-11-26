@@ -5,6 +5,7 @@ Replaces the copy-pasted helpers in the run_*.py scripts:
   * one-hot NLL / JS for choice distributions
   * full (tail-completed) JS divergence for open-ended top-k distributions
   * answer equivalence for open-ended (MATH-style) answers, with an optional LLM judge
+  * vocabulary size resolution
   * run_config.json writer
 """
 
@@ -113,17 +114,22 @@ def choice_distribution(
 def extract_choice_probs(
     logprobs_content: Sequence[Any],
     valid_labels: Sequence[str],
-) -> tuple[dict[str, float], Optional[str], dict[str, Any]]:
+) -> tuple[dict[str, float], str, dict[str, Any]]:
     """Convenience wrapper over an API ``logprobs.content`` list (first token only).
 
-    Returns ``(dist, predicted_token, info)``; raises ValueError on empty content
-    or when no valid label is observed.
+    Returns ``(dist, predicted_label, info)``: the label is the most probable
+    valid label observed in the top-k, whatever token was generated;
+    ``info["first_token"]`` keeps the generated token.  Raises ValueError on empty
+    content or when no valid label is observed.
     """
     if not logprobs_content:
         raise ValueError("empty logprobs content")
     first = logprobs_content[0]
     dist, info = choice_distribution(first.top_logprobs, valid_labels)
-    return dist, first.token.strip(), info
+    observed = {normalize_choice_token(_item_fields(item)[0]) for item in first.top_logprobs}
+    predicted = max((lab for lab in valid_labels if lab in observed), key=dist.__getitem__)
+    info["first_token"] = first.token.strip()
+    return dist, predicted, info
 
 
 def kl_onehot_choice(dist: Mapping[str, float], correct_label: str) -> float:
@@ -212,6 +218,28 @@ def completed_token_prob(
     return max(tail_mass(mass), 1e-10) / max(1, vocab_size - len(dist))
 
 
+# Checked in order against the lower-cased model name.
+_VOCAB_FAMILIES = (
+    (("gemma-3",), 262144),
+    (("gemma-2",), 256000),
+    (("llama-3", "llama3"), 128256),
+    (("ministral", "mistral"), 131072),
+)
+
+
+def resolve_vocab_size(model: str, explicit: Optional[int] = None) -> int:
+    """``explicit`` if given, else the size of a known model family, else ValueError."""
+    if explicit is not None:
+        if explicit <= 0:
+            raise ValueError(f"--vocab_size must be positive, got {explicit}")
+        return explicit
+    name = model.lower()
+    for keys, size in _VOCAB_FAMILIES:
+        if any(key in name for key in keys):
+            return size
+    raise ValueError(f"unknown vocabulary size for model {model!r}; pass --vocab_size")
+
+
 def git_commit_hash() -> Optional[str]:
     """Current git commit hash, or None when unavailable."""
     try:
@@ -265,6 +293,26 @@ def judge_equivalent(client: Any, model: str, gold: str, pred: str) -> bool:
 def make_judge(client: Any, model: str = DEFAULT_JUDGE_MODEL) -> Callable[[str, str], bool]:
     """Bind ``judge_equivalent`` to a client/model for use as ``match_answers(judge=...)``."""
     return lambda gold, pred: judge_equivalent(client, model, gold, pred)
+
+
+def openai_judge(model: str = DEFAULT_JUDGE_MODEL) -> Optional[Callable[[str, str], bool]]:
+    """Judge on an OpenAI client created at call time; None when ``model`` is "none"."""
+    if model.lower() == "none":
+        return None
+
+    def judge(gold: str, pred: str) -> bool:
+        from openai import OpenAI
+        return judge_equivalent(OpenAI(), model, gold, pred)
+
+    return judge
+
+
+def add_judge_argument(parser: Any) -> None:
+    """Add the ``--judge_model`` flag shared by the open-ended runners."""
+    parser.add_argument(
+        "--judge_model", type=str, default=DEFAULT_JUDGE_MODEL,
+        help="OpenAI model that judges answer equivalence "
+             f"(default: {DEFAULT_JUDGE_MODEL}; 'none' falls back to exact/numeric matching)")
 
 _THOUSANDS_RE = re.compile(r"^[+-]?\d{1,3}(,\d{3})+(\.\d+)?$")
 _DECIMAL_RE = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)$")
@@ -369,6 +417,19 @@ def match_answers(
     if judge is not None and judge(gold, pred):
         return True, "judge"
     return False, "none"
+
+
+def judge_correct(gold: str, pred: str, judge: Optional[Callable[[str, str], bool]]) -> bool:
+    """Correctness of an open-ended answer as decided by ``judge``.
+
+    Empty gold or prediction is incorrect.  With ``judge=None`` (judge disabled)
+    exact / numeric matching is used instead.
+    """
+    if judge is None:
+        return match_answers(gold, pred)[0]
+    if not gold or not pred or not gold.strip() or not pred.strip():
+        return False
+    return judge(gold, pred)
 
 
 def answers_equivalent(

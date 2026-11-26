@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from llm_client import create_client, make_model_tag
 import measures
+import vllm_server
 
 load_dotenv()
 
@@ -20,7 +21,7 @@ MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 PROVIDER = "vllm"
 MAX_WORKERS = 8
 TOP_LOGPROBS = 200
-VOCAB_SIZE = 151936
+VOCAB_SIZE = None
 DATA_PATH = "data/math_test.jsonl"
 
 COT_TEMPLATE = """Solve the following math problem step by step.
@@ -98,21 +99,9 @@ def load_paraphrase_results(model_tag):
     return m
 
 
-def vllm_tokenize(text):
-    import os, requests
-    base = os.environ.get("VLLM_API_BASE", "http://localhost:8000/v1").rstrip("/v1").rstrip("/")
-    return requests.post(f"{base}/tokenize", json={"prompt": text, "add_special_tokens": False}, timeout=10).json().get("tokens", [])
-
-
-def vllm_detokenize(token_ids):
-    import os, requests
-    base = os.environ.get("VLLM_API_BASE", "http://localhost:8000/v1").rstrip("/v1").rstrip("/")
-    return [requests.post(f"{base}/detokenize", json={"tokens": [tid]}, timeout=10).json().get("prompt", "") for tid in token_ids]
-
-
 def extract_distribution(logprobs_content):
     if not logprobs_content:
-        return {}, 0.0
+        raise ValueError("empty logprobs content")
     dist = {}
     mass = 0.0
     for top_lp in logprobs_content[0].top_logprobs:
@@ -154,14 +143,7 @@ def teacher_force(client, messages, correct_answer):
         return []
 
     if PROVIDER == "vllm":
-        try:
-            tids = vllm_tokenize(answer_text)
-            tokens = vllm_detokenize(tids)
-        except Exception:
-            from llm_client import get_tokenizer
-            enc = get_tokenizer(MODEL)
-            tids = enc.encode(answer_text)
-            tokens = [enc.decode([t]) for t in tids]
+        tokens = vllm_server.detokenize(MODEL, vllm_server.tokenize(MODEL, answer_text))
     else:
         from llm_client import get_tokenizer
         enc = get_tokenizer(MODEL)
@@ -219,7 +201,7 @@ def _compute_item(client, row, idx, output_path, cot_rec, para_rec):
     problem = row["problem"]
     correct_answer = extract_boxed_answer(row["solution"])
     if not correct_answer.strip():
-        return None
+        raise ValueError("empty gold answer")
 
     reasoning = cot_rec.get("reasoning", "")
     para_reasoning = para_rec.get("paraphrased_reasoning", "")
@@ -248,7 +230,7 @@ def _compute_item(client, row, idx, output_path, cot_rec, para_rec):
     ], correct_answer)
 
     if not cot_res or not para_res or not direct_res:
-        return None
+        raise ValueError("no teacher-forcing tokens")
 
     nt = min(len(cot_res), len(para_res), len(direct_res))
     kl_oh_cot, kl_oh_para, kl_cd, kl_pd, js_cp = [], [], [], [], []
@@ -289,17 +271,19 @@ def main():
     parser.add_argument("--provider", type=str, choices=["openai", "litellm", "vllm"], default="vllm")
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--top_logprobs", type=int, default=200)
+    parser.add_argument("--vocab_size", type=int, default=None)
     args = parser.parse_args()
 
     if args.model:
         global MODEL
         MODEL = args.model
-    global PROVIDER, TOP_LOGPROBS
+    global PROVIDER, TOP_LOGPROBS, VOCAB_SIZE
     PROVIDER = args.provider
     if args.workers:
         global MAX_WORKERS
         MAX_WORKERS = args.workers
     TOP_LOGPROBS = args.top_logprobs
+    VOCAB_SIZE = measures.resolve_vocab_size(MODEL, args.vocab_size)
 
     model_tag = make_model_tag(MODEL)
     client = create_client(PROVIDER)
@@ -319,7 +303,7 @@ def main():
     output_path = output_dir / "kl_para.jsonl"
     measures.write_run_config(
         output_path, model=MODEL, dataset="math_test", phase="kl_para", seed=None,
-        mask_ratio=None, n_probes=1, top_logprobs=TOP_LOGPROBS)
+        mask_ratio=None, n_probes=1, top_logprobs=TOP_LOGPROBS, vocab_size=VOCAB_SIZE)
 
     data = load_data()
     completed = load_completed_ids(output_path)

@@ -1,8 +1,12 @@
 """Unified LLM client for OpenAI, LiteLLM, and vLLM."""
 
+import math
 import os
+import re
 
 from dotenv import load_dotenv
+
+import measures
 
 load_dotenv()
 
@@ -191,10 +195,51 @@ def make_model_tag(model: str) -> str:
 # ---------------------------------------------------------------------------
 
 def get_tokenizer(model: str):
-    """Return tokenizer for the model. Falls back to cl100k_base."""
+    """Return the model's own tiktoken tokenizer; ValueError when tiktoken has none."""
     import tiktoken
 
     try:
         return tiktoken.encoding_for_model(model)
-    except (KeyError, Exception):
-        return tiktoken.get_encoding("cl100k_base")
+    except KeyError as exc:
+        raise ValueError(f"tiktoken has no tokenizer for model {model!r}") from exc
+
+
+def resolve_tiktoken_vocab_size(provider: str, model: str, explicit=None) -> int:
+    """Vocabulary size for runners that tokenize with tiktoken under the OpenAI provider."""
+    if explicit is None and provider == "openai":
+        return get_tokenizer(model).n_vocab
+    return measures.resolve_vocab_size(model, explicit)
+
+
+THINKING_COT_MAX_TOKENS = 8192
+_EMPTY_THINK_BLOCK = "<think>\n\n</think>\n\n"
+
+
+def thinking_kwargs(thinking_model: bool, enable: bool) -> dict:
+    """Request kwargs that toggle thinking on a thinking model; empty otherwise."""
+    if not thinking_model:
+        return {}
+    return {"extra_body": {"chat_template_kwargs": {"enable_thinking": enable}}}
+
+
+def extract_think_block(text: str) -> str:
+    """Content of the first <think> block, or the whole text when there is none."""
+    match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
+    return match.group(1).strip() if match else text
+
+
+def raw_teacher_force_step(client, model, messages, prefix, top_logprobs):
+    """One teacher-forced position on a thinking model with thinking off.
+
+    Uses the completions endpoint with an empty think block before ``prefix``.
+    Returns ``(distribution, observed_mass)``.
+    """
+    turns = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages)
+    prompt = f"{turns}<|im_start|>assistant\n{_EMPTY_THINK_BLOCK}{prefix}"
+    resp = client.completions.create(
+        model=model, prompt=prompt, temperature=0, max_tokens=1, logprobs=top_logprobs)
+    logprobs = resp.choices[0].logprobs
+    if not (logprobs and logprobs.top_logprobs):
+        raise ValueError("empty logprobs")
+    dist = {token: math.exp(lp) for token, lp in logprobs.top_logprobs[0].items()}
+    return dist, sum(dist.values())

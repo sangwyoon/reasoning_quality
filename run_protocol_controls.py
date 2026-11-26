@@ -22,7 +22,7 @@ to other checkpoints (cross-checkpoint trace experiment).
 
 Output (``--out``, JSONL) gets one record per item with a ``conditions`` mapping;
 each condition holds ``dist``, ``logp_gold``, ``info`` (choice_mass_observed,
-n_missing, tail_mass) and ``error``.  A failed condition has ``error`` set and no
+n_missing, tail_mass, first_token) and ``error``.  A failed condition has ``error`` set and no
 numbers; necessity values that depend on it are null.  The record-level ``error``
 is null only when every condition succeeded; resume re-runs only items whose
 record has a non-null error or is missing.  ``run_config.json`` is written next to

@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-from llm_client import create_client, make_model_tag
+from llm_client import create_client, make_model_tag, extract_think_block, raw_teacher_force_step, thinking_kwargs, THINKING_COT_MAX_TOKENS
 from paraphrase import split_reasoning_into_steps, TokenMasker, remove_one_step
 
 import measures
@@ -23,6 +23,7 @@ PROVIDER = "vllm"
 MAX_WORKERS = 8
 SEED = 42
 MASK_RATIO = 0.1
+THINKING_MODEL = False
 DATA_PATH = "data/agieval_english.jsonl"
 ALL_LETTERS = "ABCDE"
 
@@ -120,8 +121,11 @@ def process_cot(client, row, output_path):
     try:
         resp1 = client.chat.completions.create(
             model=MODEL, messages=[{"role": "user", "content": prompt}],
-            temperature=0, max_tokens=1024)
+            temperature=0, max_tokens=THINKING_COT_MAX_TOKENS if THINKING_MODEL else 1024,
+            **thinking_kwargs(THINKING_MODEL, True))
         reasoning = resp1.choices[0].message.content
+        if THINKING_MODEL:
+            reasoning = extract_think_block(reasoning)
 
         resp2 = client.chat.completions.create(
             model=MODEL, messages=[
@@ -145,6 +149,7 @@ def process_cot(client, row, output_path):
         "task": row["task"],
         "ground_truth": ground_truth,
         "predicted": predicted,
+        "first_token": mc_info.get("first_token"),
         "correct_token_prob": correct_prob,
         "top_probs": probs,
         "choice_mass_observed": mc_info.get("choice_mass_observed"),
@@ -186,6 +191,7 @@ def process_direct(client, row, output_path):
         "task": row["task"],
         "ground_truth": ground_truth,
         "predicted": predicted,
+        "first_token": mc_info.get("first_token"),
         "correct_token_prob": correct_prob,
         "top_probs": probs,
         "choice_mass_observed": mc_info.get("choice_mass_observed"),
@@ -217,6 +223,21 @@ def duplicate_step(reasoning, seed_str):
     new_steps = list(steps)
     new_steps.insert(idx + 1, steps[idx])
     return "\n\n".join(new_steps), idx
+
+
+KL_METRIC_KEYS = ("is_cot_correct", "kl_oh_cot", "kl_oh_cot_m", "js_cot_cotm", "kl_oh_dup",
+                  "kl_oh_dup_m", "js_dup_dupm", "kl_oh_sm", "kl_oh_sm_m", "js_sm_smm")
+
+
+def write_error_record(output_path, question_id, ground_truth, condition):
+    """Store a record with ``error`` and empty metrics for an item whose request failed."""
+    record = {"question_id": question_id, "ground_truth": ground_truth,
+              "error": f"answer distribution failed for condition {condition!r}"}
+    record.update({k: None for k in KL_METRIC_KEYS})
+    with write_lock:
+        with open(output_path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record
 
 
 def get_answer_dist(client, row, reasoning_text, letters):
@@ -263,7 +284,7 @@ def process_kl(client, row, output_path, cot_rec):
         r_o = get_answer_dist(client, row, orig, letters)
         r_m = get_answer_dist(client, row, masked, letters)
         if r_o is None or r_m is None:
-            return None
+            return write_error_record(output_path, question_id, ground_truth, name)
         dists[name] = (r_o[0], r_m[0])
         infos[name] = (r_o[1], r_m[1])
 
@@ -303,7 +324,14 @@ def main():
     parser.add_argument("--phase", choices=["cot", "direct", "kl", "all"], default="all")
     parser.add_argument("--top_logprobs", type=int, default=measures.MC_TOP_LOGPROBS,
                         help="top-k log-probabilities requested per answer position")
+    parser.add_argument("--thinking-model", action="store_true",
+                        help="Thinking model: thinking on for CoT, off for all other requests")
+    parser.add_argument("--mask_ratio", type=float, default=0.1)
     args = parser.parse_args()
+    global THINKING_MODEL
+    THINKING_MODEL = args.thinking_model
+    global MASK_RATIO
+    MASK_RATIO = args.mask_ratio
     measures.MC_TOP_LOGPROBS = args.top_logprobs
 
     if args.model:
@@ -326,7 +354,7 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "agieval.jsonl"
         measures.write_run_config(
-            out_path, model=MODEL, dataset="agieval_en", phase="cot", seed=SEED,
+            out_path, thinking_model=THINKING_MODEL, model=MODEL, dataset="agieval_en", phase="cot", seed=SEED,
             mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=measures.MC_TOP_LOGPROBS)
         completed = load_completed_ids(out_path)
         pending = [r for r in data if r["question_id"] not in completed]
@@ -343,7 +371,7 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "agieval.jsonl"
         measures.write_run_config(
-            out_path, model=MODEL, dataset="agieval_en", phase="direct", seed=SEED,
+            out_path, thinking_model=THINKING_MODEL, model=MODEL, dataset="agieval_en", phase="direct", seed=SEED,
             mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=measures.MC_TOP_LOGPROBS)
         completed = load_completed_ids(out_path)
         pending = [r for r in data if r["question_id"] not in completed]
@@ -370,7 +398,7 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "kl_mask10.jsonl"
         measures.write_run_config(
-            out_path, model=MODEL, dataset="agieval_en", phase="kl", seed=SEED,
+            out_path, thinking_model=THINKING_MODEL, model=MODEL, dataset="agieval_en", phase="kl", seed=SEED,
             mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=measures.MC_TOP_LOGPROBS)
         completed = load_completed_ids(out_path)
         pending = [(r, cot_map[r["question_id"]]) for r in data
@@ -382,7 +410,8 @@ def main():
                 for _ in tqdm(as_completed(futures), total=len(futures), desc="KL_m10"):
                     pass
 
-        records = [json.loads(l) for l in open(out_path)] if out_path.exists() else []
+        records = [r for r in map(json.loads, open(out_path)) if r.get("error") is None] \
+            if out_path.exists() else []
         if records:
             n = len(records)
             print(f"\n{'='*70}\nResults (model: {MODEL}, n={n}, AGIEval-EN)\n{'='*70}")

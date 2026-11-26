@@ -10,14 +10,18 @@ from dotenv import load_dotenv
 from datasets import load_dataset
 from tqdm import tqdm
 
-from llm_client import create_client, make_model_tag, get_tokenizer
+from llm_client import create_client, make_model_tag, get_tokenizer, resolve_tiktoken_vocab_size
 import measures
+import vllm_server
 
 load_dotenv()
 
 MODEL = "gpt-4o-mini"
 PROVIDER = "openai"
 TOP_LOGPROBS = 200
+JUDGE_MODEL = measures.DEFAULT_JUDGE_MODEL
+JUDGE = measures.openai_judge(JUDGE_MODEL)
+VOCAB_SIZE = None
 MAX_WORKERS = 64
 
 COT_TEMPLATE = """Solve the following math problem step by step.
@@ -48,30 +52,34 @@ write_lock = threading.Lock()
 
 def compute_avg_token_prob(logprobs_content):
     if not logprobs_content:
-        return 0.0
+        raise ValueError("empty logprobs content")
     probs = [math.exp(tok.logprob) for tok in logprobs_content]
     return sum(probs) / len(probs)
 
 
 def teacher_force_correct_prob(client, model, messages_before_answer, correct_answer):
     if not correct_answer or not correct_answer.strip():
-        return 0.0, []
+        raise ValueError("empty gold answer; nothing to teacher-force")
 
-    enc = get_tokenizer(model)
-    correct_token_ids = enc.encode(correct_answer.strip())
-    correct_tokens = [enc.decode([tid]) for tid in correct_token_ids]
-    vocab_size = getattr(enc, "n_vocab", 100277)
+    if PROVIDER == "vllm":
+        correct_tokens = vllm_server.detokenize(model, vllm_server.tokenize(model, correct_answer.strip()))
+    else:
+        enc = get_tokenizer(model)
+        correct_tokens = [enc.decode([tid]) for tid in enc.encode(correct_answer.strip())]
 
     if not correct_tokens:
-        return 0.0, []
+        raise ValueError("no answer tokens to teacher-force")
 
     token_probs = []
     forced_prefix = ""
 
     for target_token in correct_tokens:
         msgs = list(messages_before_answer)
+        extra = {}
         if forced_prefix:
             msgs.append({"role": "assistant", "content": forced_prefix})
+            if PROVIDER == "vllm":
+                extra["extra_body"] = {"continue_final_message": True, "add_generation_prompt": False}
 
         try:
             resp = client.chat.completions.create(
@@ -81,6 +89,7 @@ def teacher_force_correct_prob(client, model, messages_before_answer, correct_an
                 max_tokens=1,
                 logprobs=True,
                 top_logprobs=TOP_LOGPROBS,
+                **extra,
             )
 
             if not (resp.choices[0].logprobs and resp.choices[0].logprobs.content):
@@ -91,7 +100,7 @@ def teacher_force_correct_prob(client, model, messages_before_answer, correct_an
                 p = math.exp(top_lp.logprob)
                 dist[top_lp.token] = p
                 mass += p
-            token_probs.append(measures.completed_token_prob(dist, mass, target_token, vocab_size))
+            token_probs.append(measures.completed_token_prob(dist, mass, target_token, VOCAB_SIZE))
 
         except Exception as e:
             raise RuntimeError(
@@ -99,15 +108,8 @@ def teacher_force_correct_prob(client, model, messages_before_answer, correct_an
 
         forced_prefix += target_token
 
-    avg_prob = sum(token_probs) / len(token_probs) if token_probs else 0.0
+    avg_prob = sum(token_probs) / len(token_probs)
     return avg_prob, token_probs
-
-
-def judge_answer(client, correct_answer, given_answer):
-    """LLM equivalence judge (uses the generation model); raises if the judge call fails."""
-    if not given_answer or not given_answer.strip():
-        return False
-    return measures.judge_equivalent(client, MODEL, correct_answer, given_answer)
 
 
 def load_completed_ids(output_path: Path) -> set:
@@ -158,7 +160,7 @@ def process_cot(client, row, idx, output_path):
         generated_answer = resp2.choices[0].message.content.strip()
         generated_prob = compute_avg_token_prob(resp2.choices[0].logprobs.content)
 
-        is_correct = judge_answer(client, correct_answer, generated_answer)
+        is_correct = measures.judge_correct(str(correct_answer), generated_answer, JUDGE)
 
         if is_correct:
             correct_prob = generated_prob
@@ -220,7 +222,7 @@ def process_direct(client, row, idx, output_path):
         generated_answer = resp.choices[0].message.content.strip()
         generated_prob = compute_avg_token_prob(resp.choices[0].logprobs.content)
 
-        is_correct = judge_answer(client, correct_answer, generated_answer)
+        is_correct = measures.judge_correct(str(correct_answer), generated_answer, JUDGE)
 
         if is_correct:
             correct_prob = generated_prob
@@ -267,7 +269,7 @@ def run_experiment(exp_name):
     output_path = output_dir / "omnimath.jsonl"
     measures.write_run_config(
         output_path, model=MODEL, dataset="omnimath", phase=exp_name, seed=None,
-        mask_ratio=None, n_probes=None, top_logprobs=TOP_LOGPROBS, judge_model=MODEL)
+        mask_ratio=None, n_probes=None, top_logprobs=TOP_LOGPROBS, judge_model=JUDGE_MODEL, vocab_size=VOCAB_SIZE)
 
     print("Loading Omni-MATH dataset...")
     dataset = load_dataset("KbsdJames/Omni-MATH", split="test")
@@ -305,7 +307,7 @@ def run_experiment(exp_name):
 
 
 def main():
-    global TOP_LOGPROBS
+    global TOP_LOGPROBS, VOCAB_SIZE, JUDGE, JUDGE_MODEL
     parser = argparse.ArgumentParser(description="Run Omni-MATH experiment")
     parser.add_argument(
         "--exp",
@@ -334,6 +336,8 @@ def main():
     )
     parser.add_argument("--top_logprobs", type=int, default=TOP_LOGPROBS,
                         help="top-k log-probabilities requested per answer position")
+    parser.add_argument("--vocab_size", type=int, default=None)
+    measures.add_judge_argument(parser)
     args = parser.parse_args()
     TOP_LOGPROBS = args.top_logprobs
 
@@ -345,6 +349,9 @@ def main():
     if args.workers:
         global MAX_WORKERS
         MAX_WORKERS = args.workers
+    VOCAB_SIZE = resolve_tiktoken_vocab_size(PROVIDER, MODEL, args.vocab_size)
+    JUDGE_MODEL = args.judge_model
+    JUDGE = measures.openai_judge(JUDGE_MODEL)
 
     experiments = []
     if args.exp in ("cot", "both"):

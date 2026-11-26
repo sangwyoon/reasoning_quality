@@ -201,6 +201,7 @@ def process_cot(client, row, idx, output_path):
         "subject": row["subject"],
         "ground_truth": ground_truth,
         "predicted": predicted,
+        "first_token": mc_info.get("first_token"),
         "correct_token_prob": probs.get(ground_truth, 0.0) if probs else None,
         "top_probs": probs,
         "choice_mass_observed": mc_info.get("choice_mass_observed"),
@@ -243,12 +244,28 @@ def process_direct(client, row, idx, output_path):
         "subject": row["subject"],
         "ground_truth": ground_truth,
         "predicted": predicted,
+        "first_token": mc_info.get("first_token"),
         "correct_token_prob": probs.get(ground_truth, 0.0) if probs else None,
         "top_probs": probs,
         "choice_mass_observed": mc_info.get("choice_mass_observed"),
         "n_choices_missing": mc_info.get("n_missing"),
         "error": error,
     }
+    with write_lock:
+        with open(output_path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record
+
+
+KL_METRIC_KEYS = ("is_cot_correct", "kl_oh_cot", "kl_oh_cot_m", "js_cot_cotm", "kl_oh_dup",
+                  "kl_oh_dup_m", "js_dup_dupm", "kl_oh_sm", "kl_oh_sm_m", "js_sm_smm")
+
+
+def write_error_record(output_path, question_id, ground_truth, condition):
+    """Store a record with ``error`` and empty metrics for an item whose request failed."""
+    record = {"question_id": question_id, "ground_truth": ground_truth,
+              "error": f"answer distribution failed for condition {condition!r}"}
+    record.update({k: None for k in KL_METRIC_KEYS})
     with write_lock:
         with open(output_path, "a") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -285,7 +302,7 @@ def process_kl(client, row, idx, output_path, cot_rec):
             {"role": "user", "content": ANSWER_FOLLOWUP},
         ], question_id)
         if res is None:
-            return None
+            return write_error_record(output_path, question_id, ground_truth, name)
         dists[name], infos[name] = res
 
     def compute(o, m):
@@ -403,7 +420,7 @@ def main():
 
         records = []
         with open(p) as f:
-            records = [json.loads(l) for l in f]
+            records = [r for r in map(json.loads, f) if r.get("error") is None]
         if records:
             n = len(records)
             print(f"\n{'='*70}")

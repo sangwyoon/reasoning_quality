@@ -290,6 +290,37 @@ def whitespace_token_count(text: str) -> int:
     return len(text.split())
 
 
+EDIT_NAMES = ("paraphrase", "meaning_breaking", "delete")
+
+
+def build_draw(
+    trace: str,
+    seed: int,
+    llm: Callable[[str], str],
+    draw: int = 0,
+    rate: float = DEFAULT_RATE,
+) -> Dict[str, object]:
+    """One random draw: a single index set shared by all three edits.
+
+    Returns ``{"seed", "n_sentences", "indices", "original", "paraphrase",
+    "meaning_breaking", "delete"}``; ``original`` is the rejoined unedited
+    segments. Deterministic given (trace, seed, draw) and ``llm``; only the
+    requested draw calls ``llm``.
+    """
+    segments = split_sentences(trace)
+    draw_seed = sample_seed(seed, draw)
+    indices = select_sentences(len(segments), rate, seed=draw_seed)
+    return {
+        "seed": draw_seed,
+        "n_sentences": len(segments),
+        "indices": indices,
+        "original": "".join(segments),
+        "paraphrase": apply_edits(trace, indices, paraphrase_edit(llm), segments),
+        "meaning_breaking": apply_edits(trace, indices, meaning_breaking_edit(llm), segments),
+        "delete": apply_edits(trace, indices, delete_edit, segments),
+    }
+
+
 def build_perturbation_set(
     trace: str,
     seed: int,
@@ -317,31 +348,22 @@ def build_perturbation_set(
     """
     if n_samples < 1:
         raise ValueError("n_samples must be >= 1")
-    segments = split_sentences(trace)
-    n = len(segments)
+    n = len(split_sentences(trace))
     k = n_to_select(n, rate)
-    para = paraphrase_edit(llm)
-    brk = meaning_breaking_edit(llm)
     original_tokens = count_tokens(trace)
 
     samples = []
     for sid in range(n_samples):
-        s_seed = sample_seed(seed, sid)
-        indices = select_sentences(n, rate, seed=s_seed)
-        variants = {
-            "paraphrase": apply_edits(trace, indices, para, segments),
-            "meaning_breaking": apply_edits(trace, indices, brk, segments),
-            "delete": apply_edits(trace, indices, delete_edit, segments),
-        }
+        draw = build_draw(trace, seed, llm, sid, rate)
         samples.append(
             {
                 "sample_id": sid,
-                "seed": s_seed,
-                "indices": indices,
-                **variants,
+                "seed": draw["seed"],
+                "indices": draw["indices"],
+                **{name: draw[name] for name in EDIT_NAMES},
                 "n_tokens": {
                     "original": original_tokens,
-                    **{name: count_tokens(text) for name, text in variants.items()},
+                    **{name: count_tokens(draw[name]) for name in EDIT_NAMES},
                 },
             }
         )
@@ -358,6 +380,20 @@ def build_perturbation_set(
         "indices": first["indices"],
         "seeds": [s["seed"] for s in samples],
     }
+
+
+def make_anthropic_editor(client, model: str, max_tokens: int) -> Callable[[str], str]:
+    """Wrap an Anthropic client as ``llm(prompt) -> str``; refusals and cut-offs raise."""
+
+    def llm(prompt: str) -> str:
+        resp = client.messages.create(
+            model=model, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}]
+        )
+        if resp.stop_reason != "end_turn":
+            raise EditError(f"editor stopped with {resp.stop_reason!r}")
+        return "".join(block.text for block in resp.content if block.type == "text")
+
+    return llm
 
 
 def make_openai_editor(client, model: str, **create_kwargs) -> Callable[[str], str]:

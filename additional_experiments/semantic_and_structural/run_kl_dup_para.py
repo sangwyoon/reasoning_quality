@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from llm_client import create_client, make_model_tag
 import measures
+import vllm_server
 from paraphrase import split_reasoning_into_steps
 
 load_dotenv()
@@ -22,7 +23,7 @@ MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 PROVIDER = "vllm"
 MAX_WORKERS = 8
 TOP_LOGPROBS = 200
-VOCAB_SIZE = 151936
+VOCAB_SIZE = None
 DATA_PATH = "data/math_test.jsonl"
 SEED = 42
 
@@ -95,21 +96,9 @@ def load_cot_results(model_tag):
     return m
 
 
-def vllm_tokenize(text):
-    import os, requests
-    base = os.environ.get("VLLM_API_BASE", "http://localhost:8000/v1").rstrip("/v1").rstrip("/")
-    return requests.post(f"{base}/tokenize", json={"prompt": text, "add_special_tokens": False}, timeout=10).json().get("tokens", [])
-
-
-def vllm_detokenize(token_ids):
-    import os, requests
-    base = os.environ.get("VLLM_API_BASE", "http://localhost:8000/v1").rstrip("/v1").rstrip("/")
-    return [requests.post(f"{base}/detokenize", json={"tokens": [tid]}, timeout=10).json().get("prompt", "") for tid in token_ids]
-
-
 def extract_distribution(logprobs_content):
     if not logprobs_content:
-        return {}, 0.0
+        raise ValueError("empty logprobs content")
     dist, mass = {}, 0.0
     for top_lp in logprobs_content[0].top_logprobs:
         p = math.exp(top_lp.logprob)
@@ -146,14 +135,7 @@ def teacher_force(client, messages, correct_answer):
     if not answer_text:
         return []
     if PROVIDER == "vllm":
-        try:
-            tids = vllm_tokenize(answer_text)
-            tokens = vllm_detokenize(tids)
-        except Exception:
-            from llm_client import get_tokenizer
-            enc = get_tokenizer(MODEL)
-            tids = enc.encode(answer_text)
-            tokens = [enc.decode([t]) for t in tids]
+        tokens = vllm_server.detokenize(MODEL, vllm_server.tokenize(MODEL, answer_text))
     else:
         from llm_client import get_tokenizer
         enc = get_tokenizer(MODEL)
@@ -203,10 +185,13 @@ def self_paraphrase(client, text):
             {"role": "system", "content": PARAPHRASE_SYSTEM},
             {"role": "user", "content": text},
         ],
-        temperature=0.7,
+        temperature=0,
         max_tokens=2048,
     )
-    return resp.choices[0].message.content.strip()
+    paraphrased = (resp.choices[0].message.content or "").strip()
+    if not paraphrased:
+        raise ValueError("paraphraser returned empty output")
+    return paraphrased
 
 
 ITEM_METRIC_KEYS = ('n_tokens', 'n_steps', 'dup_step_idx', 'kl_onehot_dup', 'kl_onehot_duppara', 'kl_dup_direct', 'kl_duppara_direct', 'js_dup_duppara', 'tail_mass',)
@@ -233,7 +218,7 @@ def _compute_item(client, row, idx, output_path, cot_rec):
     problem = row["problem"]
     correct_answer = extract_boxed_answer(row["solution"])
     if not correct_answer.strip():
-        return None
+        raise ValueError("empty gold answer")
 
     reasoning = cot_rec.get("reasoning", "")
     if cot_rec.get("error") is not None or not reasoning:
@@ -267,7 +252,7 @@ def _compute_item(client, row, idx, output_path, cot_rec):
     ], correct_answer)
 
     if not dup_res or not duppara_res or not direct_res:
-        return None
+        raise ValueError("no teacher-forcing tokens")
 
     nt = min(len(dup_res), len(duppara_res), len(direct_res))
     kl_oh_dup, kl_oh_dp, kl_dup_dir, kl_dp_dir, js_dup_dp = [], [], [], [], []
@@ -312,17 +297,19 @@ def main():
     parser.add_argument("--provider", type=str, choices=["openai", "litellm", "vllm"], default="vllm")
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--top_logprobs", type=int, default=200)
+    parser.add_argument("--vocab_size", type=int, default=None)
     args = parser.parse_args()
 
     if args.model:
         global MODEL
         MODEL = args.model
-    global PROVIDER, TOP_LOGPROBS
+    global PROVIDER, TOP_LOGPROBS, VOCAB_SIZE
     PROVIDER = args.provider
     if args.workers:
         global MAX_WORKERS
         MAX_WORKERS = args.workers
     TOP_LOGPROBS = args.top_logprobs
+    VOCAB_SIZE = measures.resolve_vocab_size(MODEL, args.vocab_size)
 
     model_tag = make_model_tag(MODEL)
     client = create_client(PROVIDER)
@@ -338,7 +325,7 @@ def main():
     output_path = output_dir / "kl_duppara.jsonl"
     measures.write_run_config(
         output_path, model=MODEL, dataset="math_test", phase="kl_duppara", seed=SEED,
-        mask_ratio=None, n_probes=1, top_logprobs=TOP_LOGPROBS)
+        mask_ratio=None, n_probes=1, top_logprobs=TOP_LOGPROBS, vocab_size=VOCAB_SIZE)
 
     data = load_data()
     completed = load_completed_ids(output_path)

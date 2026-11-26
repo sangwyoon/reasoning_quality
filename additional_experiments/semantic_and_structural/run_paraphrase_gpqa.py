@@ -135,10 +135,11 @@ def process_paraphrase(client, model, row, idx, output_path,
 
     original_reasoning = cot_record["reasoning"]
     original_predicted = cot_record.get("predicted")
-    original_correct_prob = cot_record.get("correct_token_prob", 0.0)
+    original_correct_prob = cot_record.get("correct_token_prob")
 
     # 1. Reasoning split
     split_pattern, steps = split_reasoning_into_steps(original_reasoning)
+    failure = None
 
     if paraphrase_mode == "mask":
         rng = random.Random(f"{seed}_{question_id}_mask_p0")
@@ -161,16 +162,22 @@ def process_paraphrase(client, model, row, idx, output_path,
 
         transformations = {}
         new_steps = list(steps)
-        for si in selected_indices:
-            paraphrased_text, applied = paraphraser.paraphrase(steps[si])
-            new_steps[si] = paraphrased_text
-            if applied:
-                transformations[str(si)] = applied
-
-        paraphrased_reasoning = "\n\n".join(new_steps)
+        try:
+            for si in selected_indices:
+                paraphrased_text, applied = paraphraser.paraphrase(steps[si])
+                new_steps[si] = paraphrased_text
+                if applied:
+                    transformations[str(si)] = applied
+            paraphrased_reasoning = "\n\n".join(new_steps)
+        except Exception as e:
+            failure, paraphrased_reasoning = e, None
 
     error = None
     try:
+        if cot_record.get("error") is not None:
+            raise ValueError(f"CoT record has an error: {cot_record['error']}")
+        if failure is not None:
+            raise failure
         resp = client.chat.completions.create(
             model=model,
             messages=[
@@ -211,6 +218,7 @@ def process_paraphrase(client, model, row, idx, output_path,
         "transformations_applied": transformations,
         "paraphrased_reasoning": paraphrased_reasoning,
         "predicted": predicted,
+        "first_token": mc_info.get("first_token"),
         "correct_token_prob": correct_prob,
         "top_probs": probs,
         "prob_delta": (None if correct_prob is None or original_correct_prob is None

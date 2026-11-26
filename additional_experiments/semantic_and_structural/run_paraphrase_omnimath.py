@@ -18,13 +18,17 @@ from paraphrase import (
     TokenMasker,
     select_steps_to_paraphrase,
 )
-from llm_client import create_client, make_model_tag, get_tokenizer
+from llm_client import create_client, make_model_tag, get_tokenizer, resolve_tiktoken_vocab_size
 import measures
+import vllm_server
 
 load_dotenv()
 
 PROVIDER = "openai"
 TOP_LOGPROBS = 200
+JUDGE_MODEL = measures.DEFAULT_JUDGE_MODEL
+JUDGE = measures.openai_judge(JUDGE_MODEL)
+VOCAB_SIZE = None
 MAX_WORKERS = 64
 PARAPHRASE_MODEL = "gpt-4.1-nano"
 
@@ -53,30 +57,34 @@ paraphraser = None
 
 def compute_avg_token_prob(logprobs_content):
     if not logprobs_content:
-        return 0.0
+        raise ValueError("empty logprobs content")
     probs = [math.exp(tok.logprob) for tok in logprobs_content]
     return sum(probs) / len(probs)
 
 
 def teacher_force_correct_prob(client, model, messages_before_answer, correct_answer):
     if not correct_answer or not correct_answer.strip():
-        return 0.0, []
+        raise ValueError("empty gold answer; nothing to teacher-force")
 
-    enc = get_tokenizer(model)
-    correct_token_ids = enc.encode(correct_answer.strip())
-    correct_tokens = [enc.decode([tid]) for tid in correct_token_ids]
-    vocab_size = getattr(enc, "n_vocab", 100277)
+    if PROVIDER == "vllm":
+        correct_tokens = vllm_server.detokenize(model, vllm_server.tokenize(model, correct_answer.strip()))
+    else:
+        enc = get_tokenizer(model)
+        correct_tokens = [enc.decode([tid]) for tid in enc.encode(correct_answer.strip())]
 
     if not correct_tokens:
-        return 0.0, []
+        raise ValueError("no answer tokens to teacher-force")
 
     token_probs = []
     forced_prefix = ""
 
     for target_token in correct_tokens:
         msgs = list(messages_before_answer)
+        extra = {}
         if forced_prefix:
             msgs.append({"role": "assistant", "content": forced_prefix})
+            if PROVIDER == "vllm":
+                extra["extra_body"] = {"continue_final_message": True, "add_generation_prompt": False}
 
         try:
             resp = client.chat.completions.create(
@@ -86,6 +94,7 @@ def teacher_force_correct_prob(client, model, messages_before_answer, correct_an
                 max_tokens=1,
                 logprobs=True,
                 top_logprobs=TOP_LOGPROBS,
+                **extra,
             )
 
             if not (resp.choices[0].logprobs and resp.choices[0].logprobs.content):
@@ -96,7 +105,7 @@ def teacher_force_correct_prob(client, model, messages_before_answer, correct_an
                 p = math.exp(top_lp.logprob)
                 dist[top_lp.token] = p
                 mass += p
-            token_probs.append(measures.completed_token_prob(dist, mass, target_token, vocab_size))
+            token_probs.append(measures.completed_token_prob(dist, mass, target_token, VOCAB_SIZE))
 
         except Exception as e:
             raise RuntimeError(
@@ -104,15 +113,8 @@ def teacher_force_correct_prob(client, model, messages_before_answer, correct_an
 
         forced_prefix += target_token
 
-    avg_prob = sum(token_probs) / len(token_probs) if token_probs else 0.0
+    avg_prob = sum(token_probs) / len(token_probs)
     return avg_prob, token_probs
-
-
-def judge_answer(client, model, correct_answer, given_answer):
-    """LLM equivalence judge (uses the generation model); raises if the judge call fails."""
-    if not given_answer or not given_answer.strip():
-        return False
-    return measures.judge_equivalent(client, model, correct_answer, given_answer)
 
 
 def load_completed_ids(output_path: Path) -> set:
@@ -169,9 +171,11 @@ def process_paraphrase(client, model, row, idx, output_path,
         problem = row["problem"]
         correct_answer = row["answer"]
         prompt = COT_TEMPLATE.format(problem=problem)
+        if cot_record.get("error") is not None:
+            raise ValueError(f"CoT record has an error: {cot_record['error']}")
 
         original_reasoning = cot_record["reasoning"]
-        original_correct_prob = cot_record.get("correct_prob") or 0.0
+        original_correct_prob = cot_record.get("correct_prob")
         original_is_correct = cot_record.get("is_correct", False)
         original_generated_answer = cot_record.get("generated_answer", "")
 
@@ -229,7 +233,7 @@ def process_paraphrase(client, model, row, idx, output_path,
             generated_answer = resp.choices[0].message.content.strip()
             generated_prob = compute_avg_token_prob(resp.choices[0].logprobs.content)
 
-            is_correct = judge_answer(client, model, correct_answer, generated_answer)
+            is_correct = measures.judge_correct(str(correct_answer), generated_answer, JUDGE)
 
             if is_correct:
                 correct_prob = generated_prob
@@ -271,7 +275,8 @@ def process_paraphrase(client, model, row, idx, output_path,
             "is_correct": is_correct,
             "generated_prob": generated_prob,
             "correct_prob": correct_prob,
-            "prob_delta": None if correct_prob is None else correct_prob - original_correct_prob,
+            "prob_delta": (None if correct_prob is None or original_correct_prob is None
+                           else correct_prob - original_correct_prob),
             "error": error,
         }
 
@@ -289,7 +294,7 @@ def process_paraphrase(client, model, row, idx, output_path,
             "num_paraphrase": num_paraphrase if paraphrase_mode != "mask" else None,
             "original_generated_answer": cot_record.get("generated_answer", ""),
             "original_is_correct": cot_record.get("is_correct", False),
-            "original_correct_prob": cot_record.get("correct_prob", 0.0),
+            "original_correct_prob": cot_record.get("correct_prob"),
             "original_reasoning": cot_record.get("reasoning", ""),
             "split_pattern": "error",
             "num_steps": 0,
@@ -349,7 +354,7 @@ def run_paraphrase_experiment(model, num_paraphrase, seed=42,
     measures.write_run_config(
         output_path, model=model, dataset="omnimath", phase=mode_label, seed=seed,
         mask_ratio=mask_ratio if paraphrase_mode == "mask" else None, n_probes=1,
-        top_logprobs=TOP_LOGPROBS, num_paraphrase=num_paraphrase, judge_model=model)
+        top_logprobs=TOP_LOGPROBS, num_paraphrase=num_paraphrase, judge_model=JUDGE_MODEL, vocab_size=VOCAB_SIZE)
 
     print("Loading Omni-MATH dataset...")
     dataset = load_dataset("KbsdJames/Omni-MATH", split="test")
@@ -396,7 +401,7 @@ def run_paraphrase_experiment(model, num_paraphrase, seed=42,
 
 
 def main():
-    global TOP_LOGPROBS
+    global TOP_LOGPROBS, VOCAB_SIZE, JUDGE, JUDGE_MODEL
     parser = argparse.ArgumentParser(description="Run paraphrase experiment on OmniMath CoT results")
     parser.add_argument(
         "--model",
@@ -444,12 +449,14 @@ def main():
     parser.add_argument(
         "--provider",
         type=str,
-        choices=["openai", "litellm"],
+        choices=["openai", "litellm", "vllm"],
         default="openai",
         help="LLM provider (default: openai)",
     )
     parser.add_argument("--top_logprobs", type=int, default=TOP_LOGPROBS,
                         help="top-k log-probabilities requested per answer position")
+    parser.add_argument("--vocab_size", type=int, default=None)
+    measures.add_judge_argument(parser)
     args = parser.parse_args()
     TOP_LOGPROBS = args.top_logprobs
 
@@ -459,6 +466,10 @@ def main():
     if args.workers:
         global MAX_WORKERS
         MAX_WORKERS = args.workers
+
+    VOCAB_SIZE = resolve_tiktoken_vocab_size(PROVIDER, args.model, args.vocab_size)
+    JUDGE_MODEL = args.judge_model
+    JUDGE = measures.openai_judge(JUDGE_MODEL)
 
     run_paraphrase_experiment(
         model=args.model,

@@ -40,7 +40,7 @@ def _run_main(monkeypatch, module, argv):
     def no_network(*args, **kwargs):
         raise _Stop
     monkeypatch.setattr(socket.socket, "connect", no_network)
-    for name in ("create_client", "load_dataset", "load_data", "detect_vocab_size",
+    for name in ("create_client", "load_dataset", "load_data",
                  "run_paraphrase_experiment", "run_experiment"):
         if hasattr(module, name):
             monkeypatch.setattr(module, name, _stop)
@@ -76,7 +76,7 @@ def test_open_ended_runner_sets_module_constant(monkeypatch, name):
     module = importlib.import_module(name)
     monkeypatch.setattr(module, "TOP_LOGPROBS", module.TOP_LOGPROBS)
     assert module.TOP_LOGPROBS == 200
-    _run_main(monkeypatch, module, ["--top_logprobs", "41"])
+    _run_main(monkeypatch, module, ["--top_logprobs", "41", "--vocab_size", "1000"])
     assert module.TOP_LOGPROBS == 41
 
 

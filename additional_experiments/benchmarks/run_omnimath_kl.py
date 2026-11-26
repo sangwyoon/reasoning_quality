@@ -13,32 +13,23 @@ from dotenv import load_dotenv
 from datasets import load_dataset
 from tqdm import tqdm
 
-from llm_client import create_client, make_model_tag, get_tokenizer
+from llm_client import create_client, make_model_tag, get_tokenizer, extract_think_block, raw_teacher_force_step, thinking_kwargs, THINKING_COT_MAX_TOKENS
 import measures
+import vllm_server
 from paraphrase import split_reasoning_into_steps, TokenMasker, remove_one_step
 
 load_dotenv()
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 PROVIDER = "vllm"
-JUDGE_MODEL = "gpt-4.1-nano"
+JUDGE = measures.openai_judge(measures.DEFAULT_JUDGE_MODEL)
 MAX_WORKERS = 8
 TOP_LOGPROBS = 200
-VOCAB_SIZE = 151936
+THINKING_MODEL = False
+VOCAB_SIZE = None
 SEED = 42
 MASK_RATIO = 0.1
 OUTDIR = "ablation_0524"
-
-
-def detect_vocab_size(model: str) -> int:
-    m = model.lower()
-    if "gemma-3" in m:
-        return 262144
-    if "gemma-2" in m:
-        return 256000
-    if "llama-3" in m or "llama3" in m:
-        return 128256
-    return 151936
 
 COT_TEMPLATE = """Solve the following math problem step by step.
 
@@ -68,33 +59,13 @@ write_lock = threading.Lock()
 
 def compute_avg_token_prob(logprobs_content):
     if not logprobs_content:
-        return 0.0
+        raise ValueError("empty logprobs content")
     return sum(math.exp(t.logprob) for t in logprobs_content) / len(logprobs_content)
-
-
-def judge_answer(correct_answer, given_answer):
-    """LLM equivalence judge; raises if the judge call fails."""
-    if not given_answer or not given_answer.strip():
-        return False
-    from openai import OpenAI
-    return measures.judge_equivalent(OpenAI(), JUDGE_MODEL, correct_answer, given_answer)
-
-
-def vllm_tokenize(text):
-    import os, requests
-    base = os.environ.get("VLLM_API_BASE", "http://localhost:8000/v1").rstrip("/v1").rstrip("/")
-    return requests.post(f"{base}/tokenize", json={"model": MODEL, "prompt": text, "add_special_tokens": False}, timeout=10).json().get("tokens", [])
-
-
-def vllm_detokenize(token_ids):
-    import os, requests
-    base = os.environ.get("VLLM_API_BASE", "http://localhost:8000/v1").rstrip("/v1").rstrip("/")
-    return [requests.post(f"{base}/detokenize", json={"model": MODEL, "tokens": [tid]}, timeout=10).json().get("prompt", "") for tid in token_ids]
 
 
 def extract_distribution(logprobs_content):
     if not logprobs_content:
-        return {}, 0.0
+        raise ValueError("empty logprobs content")
     dist, mass = {}, 0.0
     for top_lp in logprobs_content[0].top_logprobs:
         p = math.exp(top_lp.logprob)
@@ -120,13 +91,7 @@ def teacher_force(client, messages, correct_answer):
     if not answer_text:
         return []
     if PROVIDER == "vllm":
-        try:
-            tids = vllm_tokenize(answer_text)
-            tokens = vllm_detokenize(tids)
-        except Exception:
-            enc = get_tokenizer(MODEL)
-            tids = enc.encode(answer_text)
-            tokens = [enc.decode([t]) for t in tids]
+        tokens = vllm_server.detokenize(MODEL, vllm_server.tokenize(MODEL, answer_text))
     else:
         enc = get_tokenizer(MODEL)
         tids = enc.encode(answer_text)
@@ -144,12 +109,15 @@ def teacher_force(client, messages, correct_answer):
             if PROVIDER == "vllm":
                 extra["extra_body"] = {"continue_final_message": True, "add_generation_prompt": False}
         try:
-            resp = client.chat.completions.create(
-                model=MODEL, messages=msgs, temperature=0,
-                max_tokens=1, logprobs=True, top_logprobs=TOP_LOGPROBS, **extra)
-            if not (resp.choices[0].logprobs and resp.choices[0].logprobs.content):
-                raise ValueError("empty logprobs content")
-            d, m = extract_distribution(resp.choices[0].logprobs.content)
+            if THINKING_MODEL and PROVIDER == "vllm":
+                d, m = raw_teacher_force_step(client, MODEL, messages, prefix, TOP_LOGPROBS)
+            else:
+                resp = client.chat.completions.create(
+                    model=MODEL, messages=msgs, temperature=0,
+                    max_tokens=1, logprobs=True, top_logprobs=TOP_LOGPROBS, **extra)
+                if not (resp.choices[0].logprobs and resp.choices[0].logprobs.content):
+                    raise ValueError("empty logprobs content")
+                d, m = extract_distribution(resp.choices[0].logprobs.content)
         except Exception as e:
             raise RuntimeError(f"teacher forcing failed at token {len(results)}: {e}") from e
         results.append((tok, d, m))
@@ -202,17 +170,20 @@ def process_cot(client, row, idx, output_path):
         prompt = COT_TEMPLATE.format(problem=problem)
         resp1 = client.chat.completions.create(
             model=MODEL, messages=[{"role": "user", "content": prompt}],
-            temperature=0, max_tokens=2048)
+            temperature=0, max_tokens=THINKING_COT_MAX_TOKENS if THINKING_MODEL else 2048,
+            **thinking_kwargs(THINKING_MODEL, True))
         reasoning = resp1.choices[0].message.content
+        if THINKING_MODEL:
+            reasoning = extract_think_block(reasoning)
 
         resp2 = client.chat.completions.create(
             model=MODEL, messages=[
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": reasoning},
                 {"role": "user", "content": ANSWER_FOLLOWUP},
-            ], temperature=0, max_tokens=256, logprobs=True, top_logprobs=TOP_LOGPROBS)
+            ], temperature=0, max_tokens=100, logprobs=True, top_logprobs=TOP_LOGPROBS)
         generated_answer = resp2.choices[0].message.content.strip() if resp2.choices[0].message.content else ""
-        generated_prob = compute_avg_token_prob(resp2.choices[0].logprobs.content) if resp2.choices[0].logprobs else 0.0
+        generated_prob = compute_avg_token_prob(resp2.choices[0].logprobs.content)
 
         tf_results = teacher_force(client, [
             {"role": "user", "content": prompt},
@@ -228,7 +199,7 @@ def process_cot(client, row, idx, output_path):
             correct_prob = None
             correct_tail_mass = None
 
-        is_correct = judge_answer(correct_answer, generated_answer)
+        is_correct = measures.judge_correct(correct_answer, generated_answer, JUDGE)
     except Exception as e:
         print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
         error = str(e)
@@ -309,7 +280,8 @@ def process_kl(client, row, idx, output_path, cot_rec):
     problem = row["problem"]
     correct_answer = str(row["answer"]).strip()
     if not correct_answer:
-        return None
+        return write_error_record(output_path, question_id, correct_answer,
+                                  ValueError("empty gold answer"), KL_METRIC_KEYS)
 
     reasoning = cot_rec.get("reasoning", "")
     if cot_rec.get("error") is not None or not reasoning:
@@ -344,7 +316,8 @@ def process_kl(client, row, idx, output_path, cot_rec):
 
     min_tokens = min((len(r) for r in tf_results.values() if r), default=0)
     if min_tokens == 0:
-        return None
+        return write_error_record(output_path, question_id, correct_answer,
+                                  ValueError("no teacher-forcing tokens"), KL_METRIC_KEYS)
 
     def compute(orig_key, masked_key):
         kl_oh_o, kl_oh_m, js_vals = [], [], []
@@ -391,19 +364,28 @@ def main():
     parser.add_argument("--top_logprobs", type=int, default=200)
     parser.add_argument("--outdir", type=str, default="ablation_0524", help="output base directory (results | ablation_0524)")
     parser.add_argument("--vocab_size", type=int, default=None)
+    measures.add_judge_argument(parser)
+    parser.add_argument("--thinking-model", action="store_true",
+                        help="Thinking model: thinking on for CoT, off for all other requests")
+    parser.add_argument("--mask_ratio", type=float, default=0.1)
     args = parser.parse_args()
+    global THINKING_MODEL
+    THINKING_MODEL = args.thinking_model
+    global MASK_RATIO
+    MASK_RATIO = args.mask_ratio
 
     if args.model:
         global MODEL
         MODEL = args.model
-    global PROVIDER, TOP_LOGPROBS, OUTDIR, VOCAB_SIZE
+    global PROVIDER, TOP_LOGPROBS, OUTDIR, VOCAB_SIZE, JUDGE
     PROVIDER = args.provider
     if args.workers:
         global MAX_WORKERS
         MAX_WORKERS = args.workers
     TOP_LOGPROBS = args.top_logprobs
     OUTDIR = args.outdir
-    VOCAB_SIZE = args.vocab_size if args.vocab_size else detect_vocab_size(MODEL)
+    VOCAB_SIZE = measures.resolve_vocab_size(MODEL, args.vocab_size)
+    JUDGE = measures.openai_judge(args.judge_model)
     print(f"Model: {MODEL} (vocab_size={VOCAB_SIZE}, outdir={OUTDIR})")
 
     model_tag = make_model_tag(MODEL)
@@ -421,9 +403,9 @@ def main():
         cot_dir.mkdir(parents=True, exist_ok=True)
         cot_path = cot_dir / "omni.jsonl"
         measures.write_run_config(
-            cot_path, model=MODEL, dataset="omnimath", phase="cot", seed=SEED,
-            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS,
-        judge_model=JUDGE_MODEL)
+            cot_path, thinking_model=THINKING_MODEL, model=MODEL, dataset="omnimath", phase="cot", seed=SEED,
+            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS, vocab_size=VOCAB_SIZE,
+        judge_model=args.judge_model)
         completed = load_completed_ids(cot_path)
         pending = [(i, r) for i, r in enumerate(data) if f"omni_{i}" not in completed]
         print(f"Phase 1: CoT (pending: {len(pending)})")
@@ -439,9 +421,9 @@ def main():
         dir_dir.mkdir(parents=True, exist_ok=True)
         dir_path = dir_dir / "kl_direct.jsonl"
         measures.write_run_config(
-            dir_path, model=MODEL, dataset="omnimath", phase="direct", seed=SEED,
-            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS,
-        judge_model=JUDGE_MODEL)
+            dir_path, thinking_model=THINKING_MODEL, model=MODEL, dataset="omnimath", phase="direct", seed=SEED,
+            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS, vocab_size=VOCAB_SIZE,
+        judge_model=args.judge_model)
         completed = load_completed_ids(dir_path)
         pending = [(i, r) for i, r in enumerate(data) if f"omni_{i}" not in completed]
         print(f"Phase 2: Direct KL (model: {MODEL}, pending: {len(pending)}/{len(data)})")
@@ -467,9 +449,9 @@ def main():
         kl_dir.mkdir(parents=True, exist_ok=True)
         kl_path = kl_dir / "kl_mask10.jsonl"
         measures.write_run_config(
-            kl_path, model=MODEL, dataset="omnimath", phase="kl", seed=SEED,
-            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS,
-        judge_model=JUDGE_MODEL)
+            kl_path, thinking_model=THINKING_MODEL, model=MODEL, dataset="omnimath", phase="kl", seed=SEED,
+            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS, vocab_size=VOCAB_SIZE,
+        judge_model=args.judge_model)
         completed = load_completed_ids(kl_path)
         pending = [(i, r, cot_map[f"omni_{i}"]) for i, r in enumerate(data)
                     if f"omni_{i}" not in completed and f"omni_{i}" in cot_map]

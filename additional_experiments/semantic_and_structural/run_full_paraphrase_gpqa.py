@@ -116,20 +116,20 @@ def load_source_results(source_dir: Path) -> dict:
 
 
 def llm_paraphrase(client, text):
-    error = None
-    try:
-        resp = client.chat.completions.create(
-            model=PARAPHRASE_MODEL,
-            messages=[
-                {"role": "system", "content": PARAPHRASE_SYSTEM},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.7,
-            max_tokens=2048,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return text
+    """Paraphrased text; raises on a failed request or empty output."""
+    resp = client.chat.completions.create(
+        model=PARAPHRASE_MODEL,
+        messages=[
+            {"role": "system", "content": PARAPHRASE_SYSTEM},
+            {"role": "user", "content": text},
+        ],
+        temperature=0,
+        max_tokens=2048,
+    )
+    paraphrased = (resp.choices[0].message.content or "").strip()
+    if not paraphrased:
+        raise RuntimeError("paraphraser returned empty output")
+    return paraphrased
 
 
 def process_item(exp_client, para_client, row, idx, output_path,
@@ -142,19 +142,18 @@ def process_item(exp_client, para_client, row, idx, output_path,
     else:
         original_reasoning = source_record.get("reasoning", "")
 
-    if not original_reasoning:
+    if source_record.get("error") is None and not original_reasoning:
         return None
 
-    if source_type == "cot":
-        orig_prob = source_record.get("correct_token_prob", 0.0)
-        orig_predicted = source_record.get("predicted")
-    else:
-        orig_prob = source_record.get("correct_token_prob", 0.0)
-        orig_predicted = source_record.get("predicted")
+    orig_prob = source_record.get("correct_token_prob")
+    orig_predicted = source_record.get("predicted")
 
-    paraphrased = llm_paraphrase(para_client, original_reasoning)
-
+    error = None
+    paraphrased = None
     try:
+        if source_record.get("error") is not None:
+            raise ValueError(f"source record has an error: {source_record['error']}")
+        paraphrased = llm_paraphrase(para_client, original_reasoning)
         resp = exp_client.chat.completions.create(
             model=MODEL,
             messages=[
@@ -187,6 +186,7 @@ def process_item(exp_client, para_client, row, idx, output_path,
         "original_reasoning": original_reasoning,
         "paraphrased_reasoning": paraphrased,
         "predicted": predicted,
+        "first_token": mc_info.get("first_token"),
         "correct_token_prob": correct_prob,
         "top_probs": probs,
         "prob_delta": (None if correct_prob is None or orig_prob is None
