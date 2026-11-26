@@ -132,8 +132,6 @@ def gain_definitions() -> dict:
     return defs
 
 
-# ----------------------------------------------------------------- data
-
 def load_records(path) -> pd.DataFrame:
     path = Path(path)
     if path.suffix == ".parquet":
@@ -184,8 +182,6 @@ def split_questions(question_ids: Sequence, seed: int,
     train = sorted(uniq[perm[n_test:]].tolist())
     return train, test
 
-
-# ------------------------------------------------------------- modelling
 
 def _make_pipeline(spline_cols, linear_cols, cat_cols, C, cfg: Config):
     from sklearn.compose import ColumnTransformer
@@ -266,8 +262,6 @@ def run_split(data: pd.DataFrame, seed: int, cfg: Config) -> dict:
             "test": test, "losses": losses, "chosen_c": chosen}
 
 
-# ----------------------------------------------------------- uncertainty
-
 def resample_question_indices(n_questions: int, n_boot: int,
                               rng: np.random.Generator) -> np.ndarray:
     """(n_boot, n_questions) indices of questions drawn with replacement."""
@@ -328,8 +322,6 @@ def refit_summary(data: pd.DataFrame, cfg: Config) -> dict:
         }
     return {"n_splits": cfg.n_splits, "gains_bits": summary}
 
-
-# ---------------------------------------------------------------- report
 
 def build_report(data: pd.DataFrame, info: dict, cfg: Config,
                  skip_refit: bool = False) -> tuple[dict, dict]:

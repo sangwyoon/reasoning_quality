@@ -46,7 +46,6 @@ class EditError(RuntimeError):
     """Raised when an LLM editor fails or returns an unusable (empty) response."""
 
 
-# --------------------------------------------------------------------------- split
 def _is_nonbreak_period(text: str, dot: int, next_char: str, same_line: bool) -> bool:
     """True if the '.' at ``dot`` (followed by whitespace then ``next_char``) does not end a sentence."""
     before = text[:dot]
@@ -118,7 +117,6 @@ def split_sentences(trace: str) -> List[str]:
             i += 1
             continue
 
-        # Whitespace run [i, m).
         m = i
         while m < n and trace[m].isspace():
             m += 1
@@ -155,7 +153,6 @@ def split_sentences(trace: str) -> List[str]:
     return segments
 
 
-# ------------------------------------------------------------------------ selection
 def n_to_select(n_sentences: int, rate: float = DEFAULT_RATE) -> int:
     """Number of sentences to edit: ``max(1, floor(rate*n + 0.5))`` for n >= 1, else 0.
 
@@ -193,7 +190,6 @@ def select_sentences(
     return sorted(rng.sample(range(n_sentences), k))
 
 
-# --------------------------------------------------------------------------- edits
 _PREAMBLE = re.compile(
     r"(?is)^\s*(?:sure|certainly|okay|ok|here(?:'s| is| are)|the (?:paraphrased|inverted|rewritten|revised)|"
     r"paraphrase[d]?|inverted|revised|rewritten)\b[^\n]*:\s*\n?"
@@ -283,7 +279,6 @@ def apply_edits(
     return "".join(out)
 
 
-# ------------------------------------------------------------------- perturbation set
 def sample_seed(seed: int, sample_id: int) -> int:
     """Deterministic per-sample seed from (seed, sample_id); independent of PYTHONHASHSEED."""
     digest = hashlib.sha256(f"{seed}:{sample_id}".encode()).digest()
@@ -314,7 +309,6 @@ def build_perturbation_set(
         {"n_sentences", "n_selected", "rate", "n_samples",
          "samples": [{"sample_id", "seed", "indices", "paraphrase",
                       "meaning_breaking", "delete", "n_tokens"}, ...],
-         # convenience aliases for sample 0:
          "paraphrase", "meaning_breaking", "delete", "indices", "seeds"}
 
     ``n_tokens`` maps ``original`` / ``paraphrase`` / ``meaning_breaking`` /

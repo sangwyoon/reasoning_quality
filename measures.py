@@ -45,10 +45,6 @@ JUDGE_PROMPT = (
 CHOICE_LABELS_ABCD = ("A", "B", "C", "D")
 
 
-# ---------------------------------------------------------------------------
-# Multiple-choice distributions
-# ---------------------------------------------------------------------------
-
 def _item_fields(item: Any) -> tuple[str, float]:
     """Return (token, logprob) from an object, dict or 2-tuple."""
     if isinstance(item, Mapping):
@@ -154,10 +150,6 @@ def js_choice(
     return max(js, 0.0)
 
 
-# ---------------------------------------------------------------------------
-# Open-ended (token-level) JS with the residual-vocabulary term
-# ---------------------------------------------------------------------------
-
 def js_open_ended(
     dist_p: Mapping[str, float],
     mass_p: float,
@@ -220,10 +212,6 @@ def completed_token_prob(
     return max(tail_mass(mass), 1e-10) / max(1, vocab_size - len(dist))
 
 
-# ---------------------------------------------------------------------------
-# Run configuration (reproducibility)
-# ---------------------------------------------------------------------------
-
 def git_commit_hash() -> Optional[str]:
     """Current git commit hash, or None when unavailable."""
     try:
@@ -255,10 +243,6 @@ def write_run_config(path: Any, **fields: Any) -> Path:
     out.write_text(json.dumps(config, indent=2, ensure_ascii=False, default=str) + "\n")
     return out
 
-
-# ---------------------------------------------------------------------------
-# Answer equivalence
-# ---------------------------------------------------------------------------
 
 def judge_equivalent(client: Any, model: str, gold: str, pred: str) -> bool:
     """LLM equivalence judge: True iff the model's reply starts with "yes" (case-insensitive).

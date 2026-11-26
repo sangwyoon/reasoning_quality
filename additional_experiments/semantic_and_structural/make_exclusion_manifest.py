@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-import json, glob, os
+import argparse, json, glob, os, sys
 from collections import OrderedDict
 
-BASE = "result_rebuttal"
 DATASETS = ("gsm8k", "math_t", "omni", "gpqa", "mmlu", "agie", "mmlupro")
 
 def uids(path_glob):
@@ -14,6 +13,10 @@ def uids(path_glob):
             except Exception:
                 pass
     return ids
+
+parser = argparse.ArgumentParser(description="List questions missing from ablation / KL outputs.")
+parser.add_argument("--base", default="results", help="directory holding the runner outputs")
+BASE = parser.parse_args().base
 
 manifest = OrderedDict()
 summary = []
@@ -27,6 +30,8 @@ for cot_dir in sorted(glob.glob(f"{BASE}/exp1_cot_*")):
     n = len(uids(f"{cot_dir}/*.jsonl"))
     cot_dirs.append((cot_dir, name, ds))
     max_n[ds] = max(max_n.get(ds, 0), n)
+if not cot_dirs:
+    sys.exit(f"no exp1_cot_* outputs found under {BASE!r}")
 for cot_dir, name, ds in cot_dirs:
     tag = name[len(ds) + 1:]
     cot_ids = uids(f"{cot_dir}/*.jsonl")
