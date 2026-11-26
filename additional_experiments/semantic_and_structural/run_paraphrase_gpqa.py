@@ -1,6 +1,8 @@
 
 import json
+import os
 import math
+import sys
 import argparse
 import random
 import threading
@@ -19,6 +21,7 @@ from paraphrase import (
     select_steps_to_paraphrase,
 )
 from llm_client import create_client, make_model_tag
+import measures
 
 load_dotenv()
 
@@ -71,22 +74,15 @@ def build_prompt(row, template, choices):
     )
 
 
+ANSWER_LABELS = ("A", "B", "C", "D")
+
+
 def extract_answer_probs(logprobs_content):
-    probs = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
-    seen = set()
-    predicted = None
+    """Return (probs, predicted, info); ValueError if no A-D token is observed.
 
-    if logprobs_content:
-        first_token = logprobs_content[0]
-        predicted = first_token.token.strip()
-
-        for top_lp in first_token.top_logprobs:
-            token = top_lp.token.strip().rstrip(".")
-            if token in probs and token not in seen:
-                probs[token] = math.exp(top_lp.logprob)
-                seen.add(token)
-
-    return probs, predicted
+    Choices missing from the top-k get a tail-mass fill (see measures.py).
+    """
+    return measures.extract_choice_probs(logprobs_content, ANSWER_LABELS)
 
 
 def load_completed_ids(output_path: Path) -> set:
@@ -96,7 +92,8 @@ def load_completed_ids(output_path: Path) -> set:
             for line in f:
                 try:
                     record = json.loads(line)
-                    completed.add(record["question_id"])
+                    if record.get("error") is None:
+                        completed.add(record["question_id"])
                 except json.JSONDecodeError:
                     continue
     return completed
@@ -144,8 +141,8 @@ def process_paraphrase(client, model, row, idx, output_path,
     split_pattern, steps = split_reasoning_into_steps(original_reasoning)
 
     if paraphrase_mode == "mask":
-        rng = random.Random(f"{seed}_{question_id}")
-        masker = TokenMasker(mask_ratio=mask_ratio, rng=rng, protect_latex=protect_latex)
+        rng = random.Random(f"{seed}_{question_id}_mask_p0")
+        masker = TokenMasker(mask_ratio=mask_ratio, rng=rng)
 
         mask_info = {}
         new_steps = []
@@ -172,6 +169,7 @@ def process_paraphrase(client, model, row, idx, output_path,
 
         paraphrased_reasoning = "\n\n".join(new_steps)
 
+    error = None
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -183,16 +181,19 @@ def process_paraphrase(client, model, row, idx, output_path,
             temperature=0,
             max_tokens=1,
             logprobs=True,
-            top_logprobs=5,
+            top_logprobs=measures.MC_TOP_LOGPROBS,
         )
 
-        probs, predicted = extract_answer_probs(resp.choices[0].logprobs.content)
+        probs, predicted, mc_info = extract_answer_probs(resp.choices[0].logprobs.content)
         correct_prob = probs.get(ground_truth, 0.0)
 
     except Exception as e:
-        probs = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+        print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
+        error = str(e)
+        mc_info = {}
+        probs = None
         predicted = None
-        correct_prob = 0.0
+        correct_prob = None
 
     record = {
         "question_id": question_id,
@@ -212,7 +213,11 @@ def process_paraphrase(client, model, row, idx, output_path,
         "predicted": predicted,
         "correct_token_prob": correct_prob,
         "top_probs": probs,
-        "prob_delta": correct_prob - original_correct_prob,
+        "prob_delta": (None if correct_prob is None or original_correct_prob is None
+                       else correct_prob - original_correct_prob),
+        "choice_mass_observed": mc_info.get("choice_mass_observed"),
+        "n_choices_missing": mc_info.get("n_missing"),
+        "error": error,
     }
 
     with write_lock:
@@ -255,6 +260,10 @@ def run_paraphrase_experiment(model, num_paraphrase, seed=42,
         output_dir = Path("results") / f"exp3_paraphrase_n{num_paraphrase}_gpqa_{mtag}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "gpqa.jsonl"
+    measures.write_run_config(
+        output_path, model=model, dataset="gpqa", phase=mode_label, seed=seed,
+        mask_ratio=mask_ratio if paraphrase_mode == "mask" else None, n_probes=1,
+        top_logprobs=measures.MC_TOP_LOGPROBS, num_paraphrase=num_paraphrase)
 
     print("Loading GPQA dataset...")
     dataset = load_dataset("Idavidrein/gpqa", "gpqa_main", split="train",
@@ -314,7 +323,10 @@ def main():
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--no-protect-latex", action="store_true", default=False)
     parser.add_argument("--hf_token", type=str, default=None)
+    parser.add_argument("--top_logprobs", type=int, default=measures.MC_TOP_LOGPROBS,
+                        help="top-k log-probabilities requested per answer position")
     args = parser.parse_args()
+    measures.MC_TOP_LOGPROBS = args.top_logprobs
 
     global PROVIDER, HF_TOKEN
     PROVIDER = args.provider

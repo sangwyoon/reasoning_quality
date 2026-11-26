@@ -1,8 +1,8 @@
 #!/bin/bash
 set -u
-cd ~/reasoning_paper
+cd "${REPO_DIR:-.}"
 export VLLM_API_BASE=http://localhost:8001/v1
-PY=/home/cau/.conda/envs/sangwon/bin/python
+PY="${PY:-python}"
 MM=mistralai/Ministral-3-3B-Instruct-2512
 mkdir -p logs
 
@@ -22,7 +22,9 @@ echo "server confirmed" > logs/REMOTE_STATUS
 
 VOCAB=$($PY -c "
 import json, glob
-p = glob.glob('/home/cau/.cache/huggingface/hub/models--mistralai--Ministral-3-3B-Instruct-2512/snapshots/*/config.json')[0]
+import os
+home = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
+p = glob.glob(home + '/hub/models--mistralai--Ministral-3-3B-Instruct-2512/snapshots/*/config.json')[0]
 c = json.load(open(p))
 print(c.get('vocab_size') or c.get('text_config', {}).get('vocab_size'))
 ")

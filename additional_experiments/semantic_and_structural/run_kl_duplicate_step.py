@@ -1,4 +1,5 @@
 
+import sys
 import json
 import math
 import re
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from llm_client import create_client, make_model_tag
+import measures
 from paraphrase import split_reasoning_into_steps
 
 load_dotenv()
@@ -70,7 +72,8 @@ def load_completed_ids(output_path: Path) -> set:
             for line in f:
                 try:
                     record = json.loads(line)
-                    completed.add(record["question_id"])
+                    if record.get("error") is None:
+                        completed.add(record["question_id"])
                 except json.JSONDecodeError:
                     continue
     return completed
@@ -148,26 +151,8 @@ def kl_dist_vs_dist(dist_p, mass_p, dist_q, mass_q):
 
 
 def js_divergence(dist_p, mass_p, dist_q, mass_q):
-    """Jensen-Shannon divergence: JS(P||Q) = 0.5*KL(P||M) + 0.5*KL(Q||M), M=(P+Q)/2"""
-    all_tokens = set(dist_p.keys()) | set(dist_q.keys())
-
-    remaining_p = max(1e-10, 1.0 - mass_p)
-    remaining_q = max(1e-10, 1.0 - mass_q)
-    p_default = remaining_p / max(1, VOCAB_SIZE - len(dist_p))
-    q_default = remaining_q / max(1, VOCAB_SIZE - len(dist_q))
-
-    dist_m = {}
-    for token in all_tokens:
-        p_val = dist_p.get(token, p_default)
-        q_val = dist_q.get(token, q_default)
-        dist_m[token] = 0.5 * (p_val + q_val)
-
-    mass_m = sum(dist_m.values())
-
-    kl_pm = kl_dist_vs_dist(dist_p, mass_p, dist_m, mass_m)
-    kl_qm = kl_dist_vs_dist(dist_q, mass_q, dist_m, mass_m)
-
-    return 0.5 * kl_pm + 0.5 * kl_qm
+    """Full JS over the vocabulary, including the residual-vocabulary term."""
+    return measures.js_open_ended(dist_p, mass_p, dist_q, mass_q, VOCAB_SIZE)
 
 
 def teacher_force_distribution(client, messages, correct_answer):
@@ -217,12 +202,11 @@ def teacher_force_distribution(client, messages, correct_answer):
                 top_logprobs=TOP_LOGPROBS,
                 **extra,
             )
-            if resp.choices[0].logprobs and resp.choices[0].logprobs.content:
-                dist, mass = extract_distribution(resp.choices[0].logprobs.content)
-            else:
-                dist, mass = {}, 0.0
-        except Exception:
-            dist, mass = {}, 0.0
+            if not (resp.choices[0].logprobs and resp.choices[0].logprobs.content):
+                raise ValueError("empty logprobs content")
+            dist, mass = extract_distribution(resp.choices[0].logprobs.content)
+        except Exception as e:
+            raise RuntimeError(f"teacher forcing failed at token {len(results)}: {e}") from e
 
         results.append((target_token, dist, mass))
         forced_prefix += target_token
@@ -245,7 +229,26 @@ def duplicate_step(reasoning, seed_str):
     return "\n\n".join(new_steps), dup_idx, pattern, len(steps)
 
 
+ITEM_METRIC_KEYS = ('n_tokens', 'tail_mass', 'n_steps', 'duplicated_step_idx', 'split_pattern', 'kl_onehot_cot', 'kl_onehot_dup', 'kl_cot_direct', 'kl_dup_direct', 'js_cot_dup', 'kl_onehot_cot_per_token', 'kl_onehot_dup_per_token', 'js_cot_dup_per_token',)
+
+
 def process_item(client, row, idx, output_path, cot_record):
+    """Compute and store one item; a failure is reported and stored as an ``error`` record."""
+    try:
+        return _compute_item(client, row, idx, output_path, cot_record)
+    except Exception as e:
+        question_id = f"math_t_{idx}"
+        print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
+        record = {"question_id": question_id, "type": row.get("type", ""),
+                  "ground_truth": extract_boxed_answer(row["solution"]), "error": str(e)}
+        record.update({k: None for k in ITEM_METRIC_KEYS})
+        with write_lock:
+            with open(output_path, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record
+
+
+def _compute_item(client, row, idx, output_path, cot_record):
     question_id = f"math_t_{idx}"
     problem = row["problem"]
     correct_answer = extract_boxed_answer(row["solution"])
@@ -254,7 +257,7 @@ def process_item(client, row, idx, output_path, cot_record):
         return None
 
     reasoning = cot_record.get("reasoning", "")
-    if not reasoning or "ERROR" in reasoning:
+    if cot_record.get("error") is not None or not reasoning:
         return None
 
     prompt_cot = COT_TEMPLATE.format(problem=problem)
@@ -314,6 +317,7 @@ def process_item(client, row, idx, output_path, cot_record):
         "level": row.get("level", ""),
         "ground_truth": correct_answer,
         "n_tokens": n_tokens,
+        "tail_mass": {"cot": measures.mean_tail_mass(cot_results), "dup": measures.mean_tail_mass(dup_results), "direct": measures.mean_tail_mass(direct_results)},
         "n_steps": n_steps,
         "duplicated_step_idx": dup_idx,
         "split_pattern": split_pattern,
@@ -364,6 +368,9 @@ def main():
     output_dir = Path("results") / f"kl_dupstep_math_t_{model_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "kl_dupstep.jsonl"
+    measures.write_run_config(
+        output_path, model=MODEL, dataset="math_test", phase="kl_dupstep", seed=SEED,
+        mask_ratio=None, n_probes=1, top_logprobs=TOP_LOGPROBS)
 
     data = load_data()
     completed_ids = load_completed_ids(output_path)
@@ -394,8 +401,9 @@ def main():
     records = []
     with open(output_path) as f:
         for line in f:
-            records.append(json.loads(line))
-
+            r = json.loads(line)
+            if r.get("error") is None:
+                records.append(r)
     if records:
         n = len(records)
         print(f"\n{'='*70}")

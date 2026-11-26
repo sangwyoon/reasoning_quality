@@ -1,4 +1,6 @@
-"""Core logic for paraphrase experiments: reasoning splitting, rule-based/LLM paraphrase, step selection."""
+"""Core logic for paraphrase experiments: reasoning splitting, rule-based/LLM paraphrase,
+step selection, and Bernoulli(lambda) token masking (each whitespace-delimited trace token
+is independently replaced by "<redacted_UNK>" with probability lambda)."""
 
 import re
 import random
@@ -107,6 +109,22 @@ def split_reasoning_into_steps(reasoning: str):
 
     # Cannot split -> treat entire text as single step
     return ("single", [text])
+
+
+def remove_one_step(reasoning: str, seed_str):
+    """Remove one uniformly chosen step (step-removal condition, SM).
+
+    Steps come from ``split_reasoning_into_steps`` and are rejoined with a blank line.
+
+    Returns:
+        (reasoning_without_step, removed_index); ``(None, -1)`` if the trace has
+        fewer than 2 steps (the condition is not defined for that item).
+    """
+    _, steps = split_reasoning_into_steps(reasoning)
+    if len(steps) < 2:
+        return None, -1
+    idx = random.Random(seed_str).randint(0, len(steps) - 1)
+    return "\n\n".join(steps[:idx] + steps[idx + 1:]), idx
 
 
 # ---------------------------------------------------------------------------
@@ -259,87 +277,55 @@ class LLMParaphraser:
 
 
 # ---------------------------------------------------------------------------
-# 3. Token Masking (replace k% of tokens with [UNK])
+# 3. Token Masking (Bernoulli(lambda) per token -> "<redacted_UNK>")
 # ---------------------------------------------------------------------------
 
 class TokenMasker:
-    """Random mask k% of tokens with [UNK] across all steps.
+    """Independent per-token masking of a reasoning trace.
 
-    If protect_latex=True (default), LaTeX/math is protected.
-    If protect_latex=False, LaTeX is also masked.
+    A token is a maximal run of non-whitespace characters. Each token is
+    selected independently with probability ``mask_ratio`` (lambda); the number
+    of selected tokens is therefore random (Binomial(n, lambda)) and may be 0.
+    A selected token is replaced by the literal string ``<redacted_UNK>``.
+    Whitespace between tokens is preserved exactly. All tokens are eligible:
+    choice labels (A-D) and LaTeX/math are not treated specially.
+
+    Masking is meant to be applied to the reasoning trace only, never to the
+    question or the answer prompt.
     """
 
-    UNK = "[UNK]"
+    UNK = "<redacted_UNK>"
 
     def __init__(self, mask_ratio: float = 0.1, rng: random.Random = None,
-                 protect_latex: bool = True):
+                 protect_latex: bool = False):
         """
         Args:
-            mask_ratio: fraction of tokens to mask (0.0-1.0). e.g., 0.1 = 10%
-            rng: Random instance for reproducibility
-            protect_latex: True to protect LaTeX/math, False to mask everything
+            mask_ratio: per-token masking probability lambda in [0.0, 1.0].
+            rng: Random instance (seed it for reproducibility).
+            protect_latex: accepted for call-site compatibility and ignored;
+                LaTeX/math tokens are masked like any other token.
         """
         if not 0.0 <= mask_ratio <= 1.0:
             raise ValueError(f"mask_ratio must be between 0.0 and 1.0, got {mask_ratio}")
         self.mask_ratio = mask_ratio
         self.rng = rng or random.Random()
-        self.protect_latex = protect_latex
+        self.protect_latex = False
 
     def mask(self, text: str):
-        """Replace k% of tokens in text with [UNK].
+        """Mask each whitespace-delimited token of ``text`` with probability lambda.
 
         Returns:
             (masked_text, num_masked, num_total)
         """
-        if not text.strip() or self.mask_ratio == 0.0:
-            return text, 0, 0
-
-        # 1) Protect LaTeX/math (only when protect_latex=True)
-        protected = []
-        working = text
-        if self.protect_latex:
-            for pattern, tag in _LATEX_PATTERNS:
-                def _replace(m, _tag=tag):
-                    idx = len(protected)
-                    placeholder = f"__PROTECTED_{_tag}_{idx}__"
-                    protected.append((placeholder, m.group()))
-                    return placeholder
-                working = re.sub(pattern, _replace, working)
-
-        # 2) Tokenize (whitespace-based, preserve line breaks)
-        parts = re.split(r'(\s+)', working)
-        # parts = [token, whitespace, token, whitespace, ...]
-        token_indices = [i for i, p in enumerate(parts) if p.strip()]
-
-        # Exclude placeholder tokens and choice labels (A, B, C, D) from masking
-        _PROTECTED_LABELS = {"A", "B", "C", "D", "A.", "B.", "C.", "D.",
-                             "A:", "B:", "C:", "D:", "A)", "B)", "C)", "D)"}
-        maskable = [i for i in token_indices
-                    if not parts[i].startswith("__PROTECTED_")
-                    and parts[i] not in _PROTECTED_LABELS]
-
-        num_total = len(maskable)
-        num_to_mask = max(1, round(num_total * self.mask_ratio)) if num_total > 0 else 0
-        num_to_mask = min(num_to_mask, num_total)
-
-        if num_to_mask == 0:
-            # Restore and return
-            for placeholder, original in reversed(protected):
-                working = working.replace(placeholder, original)
-            return working, 0, num_total
-
-        # 3) Random masking
-        mask_targets = set(self.rng.sample(maskable, num_to_mask))
-        for i in mask_targets:
-            parts[i] = self.UNK
-
-        masked_text = "".join(parts)
-
-        # 4) Restore placeholders (only when protect_latex=True)
-        for placeholder, original in reversed(protected):
-            masked_text = masked_text.replace(placeholder, original)
-
-        return masked_text, num_to_mask, num_total
+        parts = re.split(r'(\s+)', text)
+        token_indices = [i for i, p in enumerate(parts) if p and not p.isspace()]
+        num_total = len(token_indices)
+        num_masked = 0
+        for i in token_indices:
+            if self.rng.random() < self.mask_ratio:
+                parts[i] = self.UNK
+                num_masked += 1
+        return "".join(parts), num_masked, num_total
 
 
 # ---------------------------------------------------------------------------

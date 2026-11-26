@@ -1,19 +1,20 @@
 #!/bin/bash
 set -u
-cd /data2/reasoning_paper
+cd "${REPO_DIR:-.}"
 export VLLM_API_BASE=http://localhost:8000/v1
-export HF_HOME=/root/.cache/huggingface HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=0
+export HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=0
 export QWEN3_THINKING=1
-PY=/data2/venv8b/bin/python
+PY="${PY:-python}"
+VLLM="${VLLM:-vllm}"
 ST=logs/QWEN3_STATUS
 mkdir -p logs
 echo "qwen3 start $(date)" > $ST
 
 serve() {  # serve <model> <tp> <match>
   pkill -f "vllm serve" 2>/dev/null; sleep 8
-  HF_HUB_OFFLINE=1 nohup /data2/venv8b/bin/vllm serve "$1" --port 8000 --host 0.0.0.0 \
+  HF_HUB_OFFLINE=1 nohup "$VLLM" serve "$1" --port 8000 --host 0.0.0.0 \
     --max-logprobs 200 --tensor-parallel-size "$2" --max-model-len 16384 \
-    --gpu-memory-utilization 0.92 > /data2/tmp/vllm_q3.log 2>&1 &
+    --gpu-memory-utilization 0.92 > logs/vllm_q3.log 2>&1 &
   local deadline=$(( $(date +%s) + 1800 ))
   until $PY -c "
 import urllib.request, json, sys
@@ -21,7 +22,7 @@ try:
     d = json.load(urllib.request.urlopen('http://localhost:8000/v1/models', timeout=4))
     sys.exit(0 if '$3' in d['data'][0]['id'] else 1)
 except Exception: sys.exit(1)"; do
-    grep -q "Engine core initialization failed" /data2/tmp/vllm_q3.log 2>/dev/null && { echo "FATAL serve $1" >> $ST; exit 1; }
+    grep -q "Engine core initialization failed" logs/vllm_q3.log 2>/dev/null && { echo "FATAL serve $1" >> $ST; exit 1; }
     [ $(date +%s) -gt $deadline ] && { echo "FATAL timeout $1" >> $ST; exit 1; }
     sleep 15
   done

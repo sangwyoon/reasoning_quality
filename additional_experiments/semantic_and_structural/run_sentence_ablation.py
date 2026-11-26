@@ -2,6 +2,7 @@
 import json
 import math
 import re
+import sys
 import random
 import argparse
 import threading
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from llm_client import create_client, make_model_tag
+import measures
 
 load_dotenv()
 
@@ -20,7 +22,7 @@ PROVIDER = "vllm"
 MAX_WORKERS = 8
 SEED = 42
 SENT_RATIO = 0.1
-UNK = "[UNK]"
+UNK = "<redacted_UNK>"
 
 COT_TEMPLATE = """The following is a multiple choice question about {domain}.
 
@@ -124,44 +126,39 @@ def make_variants(client, reasoning, seed_str):
     return variants, sel
 
 
+ANSWER_LABELS = tuple(sorted(ANSWER_TOKENS))
+
+
 def extract_abcd(logprobs_content):
-    probs = {t: 0.0 for t in ANSWER_TOKENS}
-    if logprobs_content:
-        for top_lp in logprobs_content[0].top_logprobs:
-            token = top_lp.token.strip().rstrip(".")
-            if token in probs:
-                probs[token] = max(probs[token], math.exp(top_lp.logprob))
-    total = sum(probs.values())
-    if total > 0:
-        return {k: v / total for k, v in probs.items()}
-    return None
+    """Return (probs, predicted, info); ValueError if no A-D token is observed.
+
+    Choices missing from the top-k get a tail-mass fill (see measures.py).
+    """
+    return measures.extract_choice_probs(logprobs_content, ANSWER_LABELS)
 
 
-def get_answer_dist(client, prompt, reasoning_text):
+def get_answer_dist(client, prompt, reasoning_text, qid="?"):
+    """Return (dist, info), or None if the request failed or no choice was observed."""
     try:
         resp = client.chat.completions.create(
             model=MODEL, messages=[
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": reasoning_text},
                 {"role": "user", "content": ANSWER_FOLLOWUP},
-            ], temperature=0, max_tokens=1, logprobs=True, top_logprobs=5)
-        return extract_abcd(resp.choices[0].logprobs.content)
-    except Exception:
+            ], temperature=0, max_tokens=1, logprobs=True, top_logprobs=measures.MC_TOP_LOGPROBS)
+        dist, _, info = extract_abcd(resp.choices[0].logprobs.content)
+        return dist, info
+    except Exception as e:
+        print(f"[ERROR] {qid}: get_answer_dist failed: {e}", file=sys.stderr)
         return None
 
 
 def kl_onehot(gt, dist):
-    return -math.log(max(dist.get(gt, 1e-10), 1e-10))
+    return measures.kl_onehot_choice(dist, gt)
 
 
 def js_div(p, q):
-    js = 0.0
-    for t in ANSWER_TOKENS:
-        pv = max(p.get(t, 1e-10), 1e-10)
-        qv = max(q.get(t, 1e-10), 1e-10)
-        mv = 0.5 * (pv + qv)
-        js += 0.5 * pv * math.log(pv / mv) + 0.5 * qv * math.log(qv / mv)
-    return max(js, 0.0)
+    return measures.js_choice(p, q, ANSWER_LABELS)
 
 
 def build_prompt(row):
@@ -174,7 +171,7 @@ def build_prompt(row):
 def process_item(client, row, cot_rec, output_path):
     qid = cot_rec["question_id"]
     reasoning = cot_rec.get("reasoning", "")
-    if not reasoning or "ERROR" in reasoning:
+    if cot_rec.get("error") is not None or not reasoning:
         return None
     p_orig = cot_rec.get("top_probs")
     if not p_orig or sum(p_orig.values()) <= 0:
@@ -196,11 +193,14 @@ def process_item(client, row, cot_rec, output_path):
         "kl_oh_orig": kl_onehot(cot_rec["ground_truth"], p_orig),
     }
     for name, text in variants.items():
-        dist = get_answer_dist(client, prompt, text)
-        if dist is None:
+        res = get_answer_dist(client, prompt, text, qid)
+        if res is None:
             return None
+        dist, info = res
         record[f"js_{name}"] = js_div(p_orig, dist)
         record[f"kl_oh_{name}"] = kl_onehot(cot_rec["ground_truth"], dist)
+        record[f"choice_mass_observed_{name}"] = info["choice_mass_observed"]
+        record[f"n_choices_missing_{name}"] = info["n_missing"]
 
     with write_lock:
         with open(output_path, "a") as f:
@@ -214,7 +214,10 @@ def main():
     parser.add_argument("--provider", type=str, choices=["openai", "litellm", "vllm"], default="vllm")
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--hf_token", type=str, default=None)
+    parser.add_argument("--top_logprobs", type=int, default=measures.MC_TOP_LOGPROBS,
+                        help="top-k log-probabilities requested per answer position")
     args = parser.parse_args()
+    measures.MC_TOP_LOGPROBS = args.top_logprobs
 
     if args.model:
         global MODEL
@@ -251,12 +254,19 @@ def main():
     out_dir = Path("results") / f"abl_sent_gpqa_{model_tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "abl_sent.jsonl"
+    measures.write_run_config(
+        out_path, model=MODEL, dataset="gpqa", phase="sentence_ablation", seed=SEED,
+        mask_ratio=None, n_probes=1, top_logprobs=measures.MC_TOP_LOGPROBS)
     completed = set()
     if out_path.exists():
         with open(out_path) as f:
             for line in f:
-                try: completed.add(json.loads(line)["question_id"])
-                except: pass
+                try:
+                    rec = json.loads(line)
+                    if rec.get("error") is None:
+                        completed.add(rec["question_id"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
     row_map = {r["question_id"]: r for r in rows}
     pending = [(row_map[qid], cot_map[qid]) for qid in cot_map

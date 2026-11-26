@@ -1,10 +1,10 @@
 #!/bin/bash
 set -u
-cd ~/reasoning_paper
+cd "${REPO_DIR:-.}"
 export VLLM_API_BASE=http://localhost:8001/v1
-PY=/home/cau/.conda/envs/sangwon/bin/python
-VLLM=/home/cau/.conda/envs/sangwon/bin/vllm
-ENVV="CUDA_VISIBLE_DEVICES=1 PATH=/home/cau/.conda/envs/sangwon/bin:/usr/local/bin:/usr/bin:/bin LD_LIBRARY_PATH=/home/cau/.conda/envs/sangwon/lib/python3.11/site-packages/nvidia/cu13/lib"
+PY="${PY:-python}"
+VLLM="${VLLM:-vllm}"
+ENVV="CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}"
 ST=logs/MASTER_STATUS
 mkdir -p logs
 echo "start $(date)" > $ST
@@ -16,7 +16,7 @@ serve() {  # serve <model> <match>
   done
   sleep 3
   env $ENVV nohup $VLLM serve "$1" --host 0.0.0.0 --port 8001 --max-logprobs 200 \
-    --gpu-memory-utilization 0.6 --max-model-len 16384 > ~/vllm_master.log 2>&1 &
+    --gpu-memory-utilization 0.6 --max-model-len 16384 > logs/vllm_master.log 2>&1 &
   local deadline=$(( $(date +%s) + 2400 ))
   until $PY -c "
 import urllib.request, json, sys
@@ -24,7 +24,7 @@ try:
     d = json.load(urllib.request.urlopen('http://localhost:8001/v1/models', timeout=4))
     sys.exit(0 if '$2'.lower() in d['data'][0]['id'].lower() else 1)
 except Exception: sys.exit(1)"; do
-    grep -q "Engine core initialization failed" ~/vllm_master.log 2>/dev/null && { echo "FATAL serve $1" >> $ST; exit 1; }
+    grep -q "Engine core initialization failed" logs/vllm_master.log 2>/dev/null && { echo "FATAL serve $1" >> $ST; exit 1; }
     [ $(date +%s) -gt $deadline ] && { echo "FATAL timeout $1" >> $ST; exit 1; }
     sleep 20
   done
@@ -63,4 +63,4 @@ for entry in "mistralai/Ministral-3-3B-Instruct-2512:ministral-3-3b" "mistralai/
 done
 
 pkill -f "vllm serve" 2>/dev/null
-echo "CAU_MASTER_COMPLETE" >> $ST
+echo "MASTER_COMPLETE" >> $ST

@@ -1,6 +1,8 @@
 
 import json
+import os
 import math
+import sys
 import random
 import argparse
 import threading
@@ -13,6 +15,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from llm_client import create_client, make_model_tag
+import measures
 
 load_dotenv()
 
@@ -74,19 +77,15 @@ def build_prompt(row, choices):
     )
 
 
+ANSWER_LABELS = ("A", "B", "C", "D")
+
+
 def extract_answer_probs(logprobs_content):
-    probs = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
-    seen = set()
-    predicted = None
-    if logprobs_content:
-        first_token = logprobs_content[0]
-        predicted = first_token.token.strip()
-        for top_lp in first_token.top_logprobs:
-            token = top_lp.token.strip().rstrip(".")
-            if token in probs and token not in seen:
-                probs[token] = math.exp(top_lp.logprob)
-                seen.add(token)
-    return probs, predicted
+    """Return (probs, predicted, info); ValueError if no A-D token is observed.
+
+    Choices missing from the top-k get a tail-mass fill (see measures.py).
+    """
+    return measures.extract_choice_probs(logprobs_content, ANSWER_LABELS)
 
 
 def load_completed_ids(output_path: Path) -> set:
@@ -96,7 +95,8 @@ def load_completed_ids(output_path: Path) -> set:
             for line in f:
                 try:
                     record = json.loads(line)
-                    completed.add(record["question_id"])
+                    if record.get("error") is None:
+                        completed.add(record["question_id"])
                 except json.JSONDecodeError:
                     continue
     return completed
@@ -116,6 +116,7 @@ def load_source_results(source_dir: Path) -> dict:
 
 
 def llm_paraphrase(client, text):
+    error = None
     try:
         resp = client.chat.completions.create(
             model=PARAPHRASE_MODEL,
@@ -164,14 +165,17 @@ def process_item(exp_client, para_client, row, idx, output_path,
             temperature=0,
             max_tokens=1,
             logprobs=True,
-            top_logprobs=5,
+            top_logprobs=measures.MC_TOP_LOGPROBS,
         )
-        probs, predicted = extract_answer_probs(resp.choices[0].logprobs.content)
+        probs, predicted, mc_info = extract_answer_probs(resp.choices[0].logprobs.content)
         correct_prob = probs.get(ground_truth, 0.0)
-    except Exception:
-        probs = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+    except Exception as e:
+        print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
+        error = str(e)
+        mc_info = {}
+        probs = None
         predicted = None
-        correct_prob = 0.0
+        correct_prob = None
 
     record = {
         "question_id": question_id,
@@ -185,7 +189,11 @@ def process_item(exp_client, para_client, row, idx, output_path,
         "predicted": predicted,
         "correct_token_prob": correct_prob,
         "top_probs": probs,
-        "prob_delta": correct_prob - orig_prob,
+        "prob_delta": (None if correct_prob is None or orig_prob is None
+                       else correct_prob - orig_prob),
+        "choice_mass_observed": mc_info.get("choice_mass_observed"),
+        "n_choices_missing": mc_info.get("n_missing"),
+        "error": error,
     }
 
     with write_lock:
@@ -218,6 +226,10 @@ def run_experiment(source_type, mask_ratio=None):
     output_dir = Path("results") / f"exp4_fullpara_{label}_gpqa_{model_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "gpqa.jsonl"
+    measures.write_run_config(
+        output_path, model=MODEL, dataset="gpqa", phase=f"fullpara_{label}", seed=None,
+        mask_ratio=mask_ratio if source_type != "cot" else None, n_probes=1,
+        top_logprobs=measures.MC_TOP_LOGPROBS)
 
     print(f"Loading source results from: {source_dir}")
     source_map = load_source_results(source_dir)
@@ -268,7 +280,10 @@ def main():
     parser.add_argument("--provider", type=str, choices=["openai", "litellm", "vllm"], default="openai")
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--hf_token", type=str, default=None)
+    parser.add_argument("--top_logprobs", type=int, default=measures.MC_TOP_LOGPROBS,
+                        help="top-k log-probabilities requested per answer position")
     args = parser.parse_args()
+    measures.MC_TOP_LOGPROBS = args.top_logprobs
 
     if args.model:
         global MODEL

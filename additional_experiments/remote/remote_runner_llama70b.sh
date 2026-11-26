@@ -1,9 +1,8 @@
 #!/bin/bash
 set -u
-cd /data2/reasoning_paper
+cd "${REPO_DIR:-.}"
 export VLLM_API_BASE=http://localhost:8000/v1
-export HF_HOME=/root/.cache/huggingface
-PY=/data2/venv8b/bin/python
+PY="${PY:-python}"
 M70=meta-llama/Llama-3.1-70B-Instruct
 mkdir -p logs
 

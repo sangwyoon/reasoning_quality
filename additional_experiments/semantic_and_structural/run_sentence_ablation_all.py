@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import sys
 import random
 import argparse
 import threading
@@ -13,6 +14,7 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from llm_client import create_client, make_model_tag, get_tokenizer
+import measures
 from paraphrase import TokenMasker
 
 load_dotenv()
@@ -22,7 +24,7 @@ PROVIDER = "vllm"
 MAX_WORKERS = 8
 SEED = 42
 SENT_RATIO = 0.1
-UNK = "[UNK]"
+UNK = "<redacted_UNK>"
 TOP_LOGPROBS = 200
 VOCAB_SIZE = 151936
 
@@ -295,43 +297,31 @@ def make_variants(client, reasoning, seed_str):
 # ====================================================================
 
 def extract_choice_dist(logprobs_content, letters):
-    probs = {l: 0.0 for l in letters}
-    if logprobs_content:
-        for top_lp in logprobs_content[0].top_logprobs:
-            token = top_lp.token.strip().rstrip(".")
-            if token in probs:
-                probs[token] = max(probs[token], math.exp(top_lp.logprob))
-    total = sum(probs.values())
-    if total > 0:
-        return {k: v / total for k, v in probs.items()}
-    return None
+    """Return (probs, predicted, info); ValueError if no valid choice is observed.
+
+    Choices missing from the top-k get a tail-mass fill (see measures.py).
+    """
+    return measures.extract_choice_probs(logprobs_content, letters)
 
 
 def mcq_kl_onehot(gt, dist):
-    return -math.log(max(dist.get(gt, 1e-10), 1e-10))
+    return measures.kl_onehot_choice(dist, gt)
 
 
 def mcq_js(p, q, letters):
-    js = 0.0
-    for t in letters:
-        pv = max(p.get(t, 1e-10), 1e-10)
-        qv = max(q.get(t, 1e-10), 1e-10)
-        mv = 0.5 * (pv + qv)
-        js += 0.5 * pv * math.log(pv / mv) + 0.5 * qv * math.log(qv / mv)
-    return max(js, 0.0)
+    return measures.js_choice(p, q, letters)
 
 
 def mcq_answer_dist(client, prompt, reasoning_text, followup, letters):
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL, messages=[
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": reasoning_text},
-                {"role": "user", "content": followup},
-            ], temperature=0, max_tokens=1, logprobs=True, top_logprobs=5)
-        return extract_choice_dist(resp.choices[0].logprobs.content, letters)
-    except Exception:
-        return None
+    """Return (dist, info); raises if the request fails or no choice is observed."""
+    resp = client.chat.completions.create(
+        model=MODEL, messages=[
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": reasoning_text},
+            {"role": "user", "content": followup},
+        ], temperature=0, max_tokens=1, logprobs=True, top_logprobs=measures.MC_TOP_LOGPROBS)
+    dist, _, info = extract_choice_dist(resp.choices[0].logprobs.content, letters)
+    return dist, info
 
 
 # ====================================================================
@@ -376,22 +366,8 @@ def tf_kl_onehot(correct_token, dist, mass):
 
 
 def tf_js(dist_p, mass_p, dist_q, mass_q):
-    all_tokens = set(dist_p.keys()) | set(dist_q.keys())
-    p_def = max(1e-10, 1.0 - mass_p) / max(1, VOCAB_SIZE - len(dist_p))
-    q_def = max(1e-10, 1.0 - mass_q) / max(1, VOCAB_SIZE - len(dist_q))
-    dist_m = {t: 0.5 * (dist_p.get(t, p_def) + dist_q.get(t, q_def)) for t in all_tokens}
-    mass_m = sum(dist_m.values())
-    m_def = max(1e-10, 1.0 - mass_m) / max(1, VOCAB_SIZE - len(dist_m))
-    kl_pm, kl_qm = 0.0, 0.0
-    for t in all_tokens:
-        pv = dist_p.get(t, p_def)
-        qv = dist_q.get(t, q_def)
-        mv = dist_m.get(t, m_def)
-        if pv > 0 and mv > 0:
-            kl_pm += pv * math.log(pv / mv)
-        if qv > 0 and mv > 0:
-            kl_qm += qv * math.log(qv / mv)
-    return max(0.5 * kl_pm + 0.5 * kl_qm, 0.0)
+    """Full JS over the vocabulary, including the residual-vocabulary term."""
+    return measures.js_open_ended(dist_p, mass_p, dist_q, mass_q, VOCAB_SIZE)
 
 
 def teacher_force(client, messages, answer_text):
@@ -421,12 +397,11 @@ def teacher_force(client, messages, answer_text):
             resp = client.chat.completions.create(
                 model=MODEL, messages=msgs, temperature=0,
                 max_tokens=1, logprobs=True, top_logprobs=TOP_LOGPROBS, **extra)
-            if resp.choices[0].logprobs and resp.choices[0].logprobs.content:
-                d, m = extract_distribution_tf(resp.choices[0].logprobs.content)
-            else:
-                d, m = {}, 0.0
-        except Exception:
-            d, m = {}, 0.0
+            if not (resp.choices[0].logprobs and resp.choices[0].logprobs.content):
+                raise ValueError("empty logprobs content")
+            d, m = extract_distribution_tf(resp.choices[0].logprobs.content)
+        except Exception as e:
+            raise RuntimeError(f"teacher forcing failed at token {len(results)}: {e}") from e
         results.append((tok, d, m))
         prefix += tok
     return results
@@ -438,24 +413,40 @@ def open_measure(client, prompt, followup, reasoning_text, answer_text):
         {"role": "assistant", "content": reasoning_text},
         {"role": "user", "content": followup},
     ], answer_text)
-    if not res or all(not d for _, d, _ in res):
-        return None
+    if not res:
+        raise ValueError("no answer tokens to teacher-force")
     return res
 
 
 # ====================================================================
 # ====================================================================
 
+ITEM_METRIC_KEYS = ("kl_oh_orig",) + tuple(
+    f"{prefix}_{v}" for v in ("del", "mask", "para", "neg") for prefix in ("js", "kl_oh"))
+
+
 def process_item(client, row, cot_rec, output_path):
+    """Compute and store one item; a failure is reported and stored as an ``error`` record."""
+    try:
+        return _compute_item(client, row, cot_rec, output_path)
+    except Exception as e:
+        qid = row["question_id"]
+        print(f"[ERROR] {qid}: {e}", file=sys.stderr)
+        record = {"question_id": qid, "ground_truth": cot_rec.get("ground_truth"), "error": str(e)}
+        record.update({k: None for k in ITEM_METRIC_KEYS})
+        with write_lock:
+            with open(output_path, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record
+
+
+def _compute_item(client, row, cot_rec, output_path):
     qid = row["question_id"]
     reasoning = cot_rec.get("reasoning", "")
-    if not reasoning or "ERROR" in reasoning:
+    if cot_rec.get("error") is not None or not reasoning:
         return None
 
-    try:
-        variants, sel = make_variants(client, reasoning, f"{SEED}_{qid}")
-    except Exception:
-        return None
+    variants, sel = make_variants(client, reasoning, f"{SEED}_{qid}")
     if not variants:
         return None
 
@@ -473,29 +464,28 @@ def process_item(client, row, cot_rec, output_path):
             return None
         record["kl_oh_orig"] = mcq_kl_onehot(cot_rec["ground_truth"], p_orig)
         for name, text in variants.items():
-            dist = mcq_answer_dist(client, row["prompt"], text, row["followup"], letters)
-            if dist is None:
-                return None
+            res = mcq_answer_dist(client, row["prompt"], text, row["followup"], letters)
+            dist, info = res
             record[f"js_{name}"] = mcq_js(p_orig, dist, letters)
             record[f"kl_oh_{name}"] = mcq_kl_onehot(cot_rec["ground_truth"], dist)
+            record[f"choice_mass_observed_{name}"] = info["choice_mass_observed"]
+            record[f"n_choices_missing_{name}"] = info["n_missing"]
     else:
         answer_text = (cot_rec.get("ground_truth") or row.get("answer_text") or "").strip()
         if not answer_text:
             return None
         orig = open_measure(client, row["prompt"], row["followup"], reasoning, answer_text)
-        if orig is None:
-            return None
         n0 = len(orig)
         record["kl_oh_orig"] = sum(tf_kl_onehot(t, d, m) for t, d, m in orig) / n0
+        record["tail_mass_orig"] = measures.mean_tail_mass(orig)
         for name, text in variants.items():
             var = open_measure(client, row["prompt"], row["followup"], text, answer_text)
-            if var is None:
-                return None
             nt = min(len(orig), len(var))
             js_vals = [tf_js(orig[i][1], orig[i][2], var[i][1], var[i][2]) for i in range(nt)]
             kl_vals = [tf_kl_onehot(var[i][0], var[i][1], var[i][2]) for i in range(nt)]
             record[f"js_{name}"] = sum(js_vals) / nt
             record[f"kl_oh_{name}"] = sum(kl_vals) / nt
+            record[f"tail_mass_{name}"] = measures.mean_tail_mass(var)
 
     with write_lock:
         with open(output_path, "a") as f:
@@ -510,7 +500,10 @@ def main():
     parser.add_argument("--provider", type=str, choices=["openai", "litellm", "vllm"], default="vllm")
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--vocab_size", type=int, default=None)
+    parser.add_argument("--top_logprobs", type=int, default=measures.MC_TOP_LOGPROBS,
+                        help="top-k log-probabilities requested per answer position")
     args = parser.parse_args()
+    measures.MC_TOP_LOGPROBS = args.top_logprobs
 
     if args.model:
         global MODEL
@@ -541,14 +534,20 @@ def main():
     out_dir = Path("results") / f"abl_sent_{args.dataset}_{model_tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "abl_sent.jsonl"
+    measures.write_run_config(
+        out_path, model=MODEL, dataset=args.dataset, phase="sentence_ablation", seed=SEED,
+        mask_ratio=None, n_probes=1,
+        top_logprobs={"mcq": measures.MC_TOP_LOGPROBS, "open_ended": TOP_LOGPROBS})
     completed = set()
     if out_path.exists():
         with open(out_path) as f:
             for line in f:
                 try:
-                    completed.add(json.loads(line)["question_id"])
-                except Exception:
-                    pass
+                    record = json.loads(line)
+                    if record.get("error") is None:
+                        completed.add(record["question_id"])
+                except (json.JSONDecodeError, KeyError):
+                    continue
 
     pending = [(row_map[q], cot_map[q]) for q in cot_map
                if q not in completed and q in row_map]
@@ -559,7 +558,8 @@ def main():
             for _ in tqdm(as_completed(futures), total=len(futures), desc=f"Abl_{args.dataset}"):
                 pass
 
-    records = [json.loads(l) for l in open(out_path)] if out_path.exists() else []
+    records = [r for r in map(json.loads, open(out_path)) if r.get("error") is None] \
+        if out_path.exists() else []
     if records:
         n = len(records)
         print(f"\n{'='*60}\nSentence ablation ({args.dataset}, {MODEL}, n={n})\n{'='*60}")

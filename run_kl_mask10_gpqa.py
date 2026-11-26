@@ -10,6 +10,7 @@ import os
 import re
 import random
 import argparse
+import sys
 import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,7 +20,9 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from llm_client import create_client, make_model_tag
-from paraphrase import split_reasoning_into_steps, TokenMasker
+from paraphrase import split_reasoning_into_steps, TokenMasker, remove_one_step
+
+import measures
 
 load_dotenv()
 
@@ -99,39 +102,26 @@ def build_prompt(row, choices, template=None):
     )
 
 
+ANSWER_LABELS = tuple(sorted(ANSWER_TOKENS))
+
+
 def extract_abcd(logprobs_content):
-    probs = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
-    predicted = None
-    if logprobs_content:
-        first = logprobs_content[0]
-        predicted = first.token.strip()
-        for top_lp in first.top_logprobs:
-            token = top_lp.token.strip().rstrip(".")
-            if token in probs:
-                probs[token] = max(probs[token], math.exp(top_lp.logprob))
-    total = sum(probs.values())
-    if total > 0:
-        probs = {k: v / total for k, v in probs.items()}
-    else:
-        probs = {k: 0.25 for k in probs}
-    return probs, predicted
+    """Return (probs, predicted, info); ValueError if no A-D token is observed.
+
+    Choices missing from the top-k get a tail-mass fill (see measures.py).
+    """
+    return measures.extract_choice_probs(logprobs_content, ANSWER_LABELS)
 
 
 def kl_onehot(correct_token, dist):
-    return -math.log(max(dist.get(correct_token, 1e-10), 1e-10))
+    return measures.kl_onehot_choice(dist, correct_token)
 
 
 def js_div(dist_p, dist_q):
-    js = 0.0
-    for t in ANSWER_TOKENS:
-        pv = max(dist_p.get(t, 1e-10), 1e-10)
-        qv = max(dist_q.get(t, 1e-10), 1e-10)
-        mv = 0.5 * (pv + qv)
-        js += 0.5 * pv * math.log(pv / mv) + 0.5 * qv * math.log(qv / mv)
-    return max(js, 0.0)
+    return measures.js_choice(dist_p, dist_q, ANSWER_LABELS)
 
 
-def get_answer_dist(client, messages):
+def get_answer_dist(client, messages, question_id="?"):
     try:
         eb = _extra_body(enable_thinking=False)
         kwargs = {}
@@ -139,13 +129,14 @@ def get_answer_dist(client, messages):
             kwargs["extra_body"] = eb
         resp = client.chat.completions.create(
             model=MODEL, messages=messages, temperature=0,
-            max_tokens=1, logprobs=True, top_logprobs=5, **kwargs)
+            max_tokens=1, logprobs=True, top_logprobs=measures.MC_TOP_LOGPROBS, **kwargs)
         if resp.choices[0].logprobs and resp.choices[0].logprobs.content:
-            probs, _ = extract_abcd(resp.choices[0].logprobs.content)
-            return probs
-    except:
-        pass
-    return {"A": 0.25, "B": 0.25, "C": 0.25, "D": 0.25}
+            probs, _, info = extract_abcd(resp.choices[0].logprobs.content)
+            return probs, info
+        raise ValueError("empty logprobs content")
+    except Exception as e:
+        print(f"[ERROR] {question_id}: get_answer_dist failed: {e}", file=sys.stderr)
+        return None
 
 
 def load_completed_ids(output_path):
@@ -154,15 +145,18 @@ def load_completed_ids(output_path):
         with open(output_path) as f:
             for line in f:
                 try:
-                    completed.add(json.loads(line)["question_id"])
-                except:
+                    record = json.loads(line)
+                    if record.get("error") is None:
+                        completed.add(record["question_id"])
+                except (json.JSONDecodeError, KeyError):
                     pass
     return completed
 
 
-def apply_mask10(text, seed_str):
-    rng = random.Random(seed_str)
-    masker = TokenMasker(mask_ratio=MASK_RATIO, rng=rng, protect_latex=False)
+def apply_mask10(text, seed_str, probe_id=0):
+    """Mask the reasoning trace: each token independently with probability MASK_RATIO."""
+    rng = random.Random(f"{seed_str}_p{probe_id}")
+    masker = TokenMasker(mask_ratio=MASK_RATIO, rng=rng)
     masked, _, _ = masker.mask(text)
     return masked
 
@@ -178,25 +172,14 @@ def duplicate_step(reasoning, seed_str):
     return "\n\n".join(new_steps), idx
 
 
-def mask_one_step(reasoning, seed_str):
-    _, steps = split_reasoning_into_steps(reasoning)
-    if len(steps) < 2:
-        return reasoning, -1
-    rng = random.Random(seed_str)
-    idx = rng.randint(0, len(steps) - 1)
-    masker = TokenMasker(mask_ratio=1.0, rng=rng, protect_latex=False)
-    masked_step, _, _ = masker.mask(steps[idx])
-    new_steps = list(steps)
-    new_steps[idx] = masked_step
-    return "\n\n".join(new_steps), idx
-
-
 # ---- Phase 1: CoT ----
 
 def process_cot(client, row, idx, output_path, choices, ground_truth):
     question_id = f"gpqa_{idx}"
     prompt = build_prompt(row, choices)
 
+    error = None
+    mc_info = {}
     try:
         # Step 1: Generate reasoning
         eb1 = _extra_body(enable_thinking=True)
@@ -219,16 +202,18 @@ def process_cot(client, row, idx, output_path, choices, ground_truth):
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": reasoning},
                 {"role": "user", "content": ANSWER_FOLLOWUP},
-            ], temperature=0, max_tokens=1, logprobs=True, top_logprobs=5, **kwargs2)
+            ], temperature=0, max_tokens=1, logprobs=True, top_logprobs=measures.MC_TOP_LOGPROBS, **kwargs2)
 
-        probs, predicted = extract_abcd(resp2.choices[0].logprobs.content)
+        probs, predicted, mc_info = extract_abcd(resp2.choices[0].logprobs.content)
         correct_prob = probs.get(ground_truth, 0.0)
 
     except Exception as e:
-        reasoning = f"ERROR: {str(e)}"
-        probs = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+        print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
+        error = str(e)
+        reasoning = f"ERROR: {error}"
+        probs = None
         predicted = None
-        correct_prob = 0.0
+        correct_prob = None
 
     record = {
         "question_id": question_id,
@@ -237,6 +222,9 @@ def process_cot(client, row, idx, output_path, choices, ground_truth):
         "predicted": predicted,
         "correct_token_prob": correct_prob,
         "top_probs": probs,
+        "choice_mass_observed": mc_info.get("choice_mass_observed"),
+        "n_choices_missing": mc_info.get("n_missing"),
+        "error": error,
         "reasoning": reasoning,
     }
 
@@ -252,6 +240,8 @@ def process_direct(client, row, idx, output_path, choices, ground_truth):
     question_id = f"gpqa_{idx}"
     prompt = build_prompt(row, choices, DIRECT_TEMPLATE)
 
+    error = None
+    mc_info = {}
     try:
         eb = _extra_body(enable_thinking=False)
         kwargs = {}
@@ -259,15 +249,17 @@ def process_direct(client, row, idx, output_path, choices, ground_truth):
             kwargs["extra_body"] = eb
         resp = client.chat.completions.create(
             model=MODEL, messages=[{"role": "user", "content": prompt}],
-            temperature=0, max_tokens=1, logprobs=True, top_logprobs=5, **kwargs)
+            temperature=0, max_tokens=1, logprobs=True, top_logprobs=measures.MC_TOP_LOGPROBS, **kwargs)
 
-        probs, predicted = extract_abcd(resp.choices[0].logprobs.content)
+        probs, predicted, mc_info = extract_abcd(resp.choices[0].logprobs.content)
         correct_prob = probs.get(ground_truth, 0.0)
 
     except Exception as e:
-        probs = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+        print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
+        error = str(e)
+        probs = None
         predicted = None
-        correct_prob = 0.0
+        correct_prob = None
 
     record = {
         "question_id": question_id,
@@ -276,6 +268,9 @@ def process_direct(client, row, idx, output_path, choices, ground_truth):
         "predicted": predicted,
         "correct_token_prob": correct_prob,
         "top_probs": probs,
+        "choice_mass_observed": mc_info.get("choice_mass_observed"),
+        "n_choices_missing": mc_info.get("n_missing"),
+        "error": error,
     }
 
     with write_lock:
@@ -292,16 +287,16 @@ def process_kl(client, row, idx, output_path, cot_rec, choices, ground_truth):
     seed_base = f"{SEED}_{question_id}"
 
     reasoning = cot_rec.get("reasoning", "")
-    if not reasoning or "ERROR" in reasoning:
+    if cot_rec.get("error") is not None or not reasoning:
         return None
 
     cot_original = reasoning
     dup_original, _ = duplicate_step(reasoning, seed_base)
-    sm_original, _ = mask_one_step(reasoning, seed_base)
+    sm_original, _ = remove_one_step(reasoning, seed_base)
 
     cot_masked = apply_mask10(cot_original, f"m10_{seed_base}_cot")
     dup_masked = apply_mask10(dup_original, f"m10_{seed_base}_dup")
-    sm_masked = apply_mask10(sm_original, f"m10_{seed_base}_sm")
+    sm_masked = apply_mask10(sm_original, f"m10_{seed_base}_sm") if sm_original is not None else None
 
     conditions = {
         "cot": cot_original, "cot_m": cot_masked,
@@ -310,12 +305,18 @@ def process_kl(client, row, idx, output_path, cot_rec, choices, ground_truth):
     }
 
     dists = {}
+    infos = {}
     for name, reas in conditions.items():
-        dists[name] = get_answer_dist(client, [
+        if reas is None:
+            continue
+        res = get_answer_dist(client, [
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": reas},
             {"role": "user", "content": ANSWER_FOLLOWUP},
-        ])
+        ], question_id)
+        if res is None:
+            return None
+        dists[name], infos[name] = res
 
     def compute(orig_key, masked_key):
         od = dists[orig_key]
@@ -324,7 +325,10 @@ def process_kl(client, row, idx, output_path, cot_rec, choices, ground_truth):
 
     kl_c, kl_cm, js_c = compute("cot", "cot_m")
     kl_d, kl_dm, js_d = compute("dup", "dup_m")
-    kl_s, kl_sm, js_s = compute("sm", "sm_m")
+    if "sm" in dists:
+        kl_s, kl_sm, js_s = compute("sm", "sm_m")
+    else:
+        kl_s = kl_sm = js_s = None
 
     record = {
         "question_id": question_id,
@@ -334,6 +338,8 @@ def process_kl(client, row, idx, output_path, cot_rec, choices, ground_truth):
         "kl_oh_cot": kl_c, "kl_oh_cot_m": kl_cm, "js_cot_cotm": js_c,
         "kl_oh_dup": kl_d, "kl_oh_dup_m": kl_dm, "js_dup_dupm": js_d,
         "kl_oh_sm": kl_s, "kl_oh_sm_m": kl_sm, "js_sm_smm": js_s,
+        "choice_mass_observed": {k: v["choice_mass_observed"] for k, v in infos.items()},
+        "n_choices_missing": {k: v["n_missing"] for k, v in infos.items()},
     }
 
     with write_lock:
@@ -352,7 +358,10 @@ def main():
     parser.add_argument("--thinking-model", action="store_true",
                         help="Enable thinking toggle for Qwen3 (enable_thinking=True for CoT, False for answer extraction)")
     parser.add_argument("--hf_token", type=str, default=None)
+    parser.add_argument("--top_logprobs", type=int, default=measures.MC_TOP_LOGPROBS,
+                        help="top-k log-probabilities requested per answer position")
     args = parser.parse_args()
+    measures.MC_TOP_LOGPROBS = args.top_logprobs
 
     if args.model:
         global MODEL
@@ -386,6 +395,9 @@ def main():
         cot_dir = Path("results") / f"exp1_cot_gpqa_{model_tag}"
         cot_dir.mkdir(parents=True, exist_ok=True)
         cot_path = cot_dir / "gpqa.jsonl"
+        measures.write_run_config(
+            cot_path, model=MODEL, dataset="gpqa", phase="cot", seed=SEED,
+            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=measures.MC_TOP_LOGPROBS)
         completed = load_completed_ids(cot_path)
         pending = [(i, r, ch, gt) for i, r, ch, gt in shuffled if f"gpqa_{i}" not in completed]
         print(f"Phase 1: CoT (model: {MODEL}, pending: {len(pending)}/{len(shuffled)})")
@@ -401,6 +413,9 @@ def main():
         dir_dir = Path("results") / f"exp2_direct_gpqa_{model_tag}"
         dir_dir.mkdir(parents=True, exist_ok=True)
         dir_path = dir_dir / "gpqa.jsonl"
+        measures.write_run_config(
+            dir_path, model=MODEL, dataset="gpqa", phase="direct", seed=SEED,
+            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=measures.MC_TOP_LOGPROBS)
         completed = load_completed_ids(dir_path)
         pending = [(i, r, ch, gt) for i, r, ch, gt in shuffled if f"gpqa_{i}" not in completed]
         print(f"Phase 2: Direct (model: {MODEL}, pending: {len(pending)}/{len(shuffled)})")
@@ -426,6 +441,9 @@ def main():
         kl_dir = Path("results") / f"kl_mask10_gpqa_{model_tag}"
         kl_dir.mkdir(parents=True, exist_ok=True)
         kl_path = kl_dir / "kl_mask10.jsonl"
+        measures.write_run_config(
+            kl_path, model=MODEL, dataset="gpqa", phase="kl", seed=SEED,
+            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=measures.MC_TOP_LOGPROBS)
         completed = load_completed_ids(kl_path)
         pending = [(i, r, ch, gt, cot_map[f"gpqa_{i}"]) for i, r, ch, gt in shuffled
                     if f"gpqa_{i}" not in completed and f"gpqa_{i}" in cot_map]
@@ -451,9 +469,12 @@ def main():
                 ("Dup", "kl_oh_dup", "kl_oh_dup_m", "js_dup_dupm"),
                 ("SM", "kl_oh_sm", "kl_oh_sm_m", "js_sm_smm"),
             ]:
-                o = sum(r[oh] for r in records) / n
-                m = sum(r[ohm] for r in records) / n
-                j = sum(r[js] for r in records) / n
+                rs = [r for r in records if r[oh] is not None]
+                if not rs:
+                    continue
+                o = sum(r[oh] for r in rs) / len(rs)
+                m = sum(r[ohm] for r in rs) / len(rs)
+                j = sum(r[js] for r in rs) / len(rs)
                 print(f"  {label:<4}: KL(oh∥orig)={o:.4f}  KL(oh∥masked)={m:.4f}  Δ={m-o:+.4f}  JS={j:.4f}")
 
 

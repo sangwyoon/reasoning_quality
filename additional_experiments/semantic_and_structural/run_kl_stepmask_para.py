@@ -1,4 +1,5 @@
 
+import sys
 import json
 import math
 import re
@@ -12,7 +13,8 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from llm_client import create_client, make_model_tag
-from paraphrase import split_reasoning_into_steps, TokenMasker
+import measures
+from paraphrase import split_reasoning_into_steps, remove_one_step
 
 load_dotenv()
 
@@ -74,9 +76,11 @@ def load_completed_ids(output_path: Path) -> set:
         with open(output_path) as f:
             for line in f:
                 try:
-                    completed.add(json.loads(line)["question_id"])
-                except:
-                    pass
+                    record = json.loads(line)
+                    if record.get("error") is None:
+                        completed.add(record["question_id"])
+                except (json.JSONDecodeError, KeyError):
+                    continue
     return completed
 
 
@@ -133,12 +137,8 @@ def kl_pq(dist_p, mass_p, dist_q, mass_q):
 
 
 def js_div(dist_p, mass_p, dist_q, mass_q):
-    all_tokens = set(dist_p.keys()) | set(dist_q.keys())
-    p_def = max(1e-10, 1.0 - mass_p) / max(1, VOCAB_SIZE - len(dist_p))
-    q_def = max(1e-10, 1.0 - mass_q) / max(1, VOCAB_SIZE - len(dist_q))
-    dist_m = {t: 0.5 * (dist_p.get(t, p_def) + dist_q.get(t, q_def)) for t in all_tokens}
-    mass_m = sum(dist_m.values())
-    return 0.5 * kl_pq(dist_p, mass_p, dist_m, mass_m) + 0.5 * kl_pq(dist_q, mass_q, dist_m, mass_m)
+    """Full JS over the vocabulary, including the residual-vocabulary term."""
+    return measures.js_open_ended(dist_p, mass_p, dist_q, mass_q, VOCAB_SIZE)
 
 
 def teacher_force(client, messages, correct_answer):
@@ -149,7 +149,7 @@ def teacher_force(client, messages, correct_answer):
         try:
             tids = vllm_tokenize(answer_text)
             tokens = vllm_detokenize(tids)
-        except:
+        except Exception:
             from llm_client import get_tokenizer
             enc = get_tokenizer(MODEL)
             tids = enc.encode(answer_text)
@@ -175,50 +175,49 @@ def teacher_force(client, messages, correct_answer):
             resp = client.chat.completions.create(
                 model=MODEL, messages=msgs, temperature=0,
                 max_tokens=1, logprobs=True, top_logprobs=TOP_LOGPROBS, **extra)
-            if resp.choices[0].logprobs and resp.choices[0].logprobs.content:
-                d, m = extract_distribution(resp.choices[0].logprobs.content)
-            else:
-                d, m = {}, 0.0
-        except:
-            d, m = {}, 0.0
+            if not (resp.choices[0].logprobs and resp.choices[0].logprobs.content):
+                raise ValueError("empty logprobs content")
+            d, m = extract_distribution(resp.choices[0].logprobs.content)
+        except Exception as e:
+            raise RuntimeError(f"teacher forcing failed at token {len(results)}: {e}") from e
         results.append((tok, d, m))
         prefix += tok
     return results
 
 
-def mask_one_step(reasoning, seed_str):
-    pattern, steps = split_reasoning_into_steps(reasoning)
-    if len(steps) < 2:
-        return reasoning, -1, len(steps)
-
-    rng = random.Random(seed_str)
-    mask_idx = rng.randint(0, len(steps) - 1)
-
-    masker = TokenMasker(mask_ratio=1.0, rng=rng, protect_latex=False)
-    masked_step, _, _ = masker.mask(steps[mask_idx])
-
-    new_steps = list(steps)
-    new_steps[mask_idx] = masked_step
-    return "\n\n".join(new_steps), mask_idx, len(steps)
-
-
 def self_paraphrase(client, text):
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": PARAPHRASE_SYSTEM},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.7,
-            max_tokens=2048,
-        )
-        return resp.choices[0].message.content.strip()
-    except:
-        return text
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": PARAPHRASE_SYSTEM},
+            {"role": "user", "content": text},
+        ],
+        temperature=0.7,
+        max_tokens=2048,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+ITEM_METRIC_KEYS = ('n_tokens', 'n_steps', 'masked_step_idx', 'kl_onehot_stepmask', 'kl_onehot_stepmask_para', 'kl_stepmask_direct', 'kl_stepmask_para_direct', 'js_stepmask_para', 'tail_mass',)
 
 
 def process_item(client, row, idx, output_path, cot_rec):
+    """Compute and store one item; a failure is reported and stored as an ``error`` record."""
+    try:
+        return _compute_item(client, row, idx, output_path, cot_rec)
+    except Exception as e:
+        question_id = f"math_t_{idx}"
+        print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
+        record = {"question_id": question_id, "type": row.get("type", ""),
+                  "ground_truth": extract_boxed_answer(row["solution"]), "error": str(e)}
+        record.update({k: None for k in ITEM_METRIC_KEYS})
+        with write_lock:
+            with open(output_path, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record
+
+
+def _compute_item(client, row, idx, output_path, cot_rec):
     question_id = f"math_t_{idx}"
     problem = row["problem"]
     correct_answer = extract_boxed_answer(row["solution"])
@@ -226,13 +225,16 @@ def process_item(client, row, idx, output_path, cot_rec):
         return None
 
     reasoning = cot_rec.get("reasoning", "")
-    if not reasoning or "ERROR" in reasoning:
+    if cot_rec.get("error") is not None or not reasoning:
         return None
 
     prompt = COT_TEMPLATE.format(problem=problem)
 
-    # 1. Mask one step
-    masked_reasoning, mask_idx, n_steps = mask_one_step(reasoning, f"{SEED}_{question_id}")
+    # 1. Remove one step (undefined for traces with fewer than 2 steps: item skipped)
+    masked_reasoning, mask_idx = remove_one_step(reasoning, f"{SEED}_{question_id}")
+    if masked_reasoning is None:
+        return None
+    n_steps = len(split_reasoning_into_steps(reasoning)[1])
 
     # 2. Paraphrase the masked reasoning
     masked_para_reasoning = self_paraphrase(client, masked_reasoning)
@@ -287,6 +289,7 @@ def process_item(client, row, idx, output_path, cot_rec):
         "kl_stepmask_direct": avg(kl_sm_dir),
         "kl_stepmask_para_direct": avg(kl_smp_dir),
         "js_stepmask_para": avg(js_sm_smp),
+        "tail_mass": {"stepmask": measures.mean_tail_mass(sm_res), "stepmask_para": measures.mean_tail_mass(smp_res), "direct": measures.mean_tail_mass(direct_res)},
     }
 
     with write_lock:
@@ -325,6 +328,9 @@ def main():
     output_dir = Path("results") / f"kl_stepmask_math_t_{model_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "kl_stepmask.jsonl"
+    measures.write_run_config(
+        output_path, model=MODEL, dataset="math_test", phase="kl_stepmask", seed=SEED,
+        mask_ratio=None, n_probes=1, top_logprobs=TOP_LOGPROBS)
 
     data = load_data()
     completed = load_completed_ids(output_path)
@@ -352,7 +358,9 @@ def main():
     records = []
     with open(output_path) as f:
         for line in f:
-            records.append(json.loads(line))
+            r = json.loads(line)
+            if r.get("error") is None:
+                records.append(r)
     if records:
         n = len(records)
         print(f"\n{'='*60}")

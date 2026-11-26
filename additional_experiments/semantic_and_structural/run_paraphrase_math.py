@@ -20,6 +20,7 @@ from paraphrase import (
     select_steps_to_paraphrase,
 )
 from llm_client import create_client, make_model_tag, get_tokenizer
+import measures
 
 load_dotenv()
 
@@ -27,7 +28,7 @@ PROVIDER = "openai"
 MAX_WORKERS = 64
 PARAPHRASE_MODEL = "gpt-4.1-nano"
 JUDGE_MODEL = "gpt-4.1-nano"
-TOP_LOGPROBS = 20  # OpenAI: 20, Together AI: 5
+TOP_LOGPROBS = 200
 
 COT_TEMPLATE = """Solve the following math problem step by step.
 
@@ -44,13 +45,6 @@ RULES:
 Write the reasoning process as Step 1: ~~, Step 2: ~~ ... Step n: ~~"""
 
 ANSWER_FOLLOWUP = 'Now state ONLY the final answer\n(a number, expression, or short mathematical notation). Nothing else.\n\nAnswer:'
-
-JUDGE_TEMPLATE = """You are a math answer equivalence checker. Determine if the given answer is mathematically equivalent to the correct answer.
-
-Correct answer: {correct_answer}
-Given answer: {given_answer}
-
-Are these two answers mathematically equivalent? Answer with ONLY "yes" or "no"."""
 
 write_lock = threading.Lock()
 paraphraser = None
@@ -78,6 +72,7 @@ def teacher_force_correct_prob(client, model, messages_before_answer, correct_an
     enc = get_tokenizer(model)
     correct_token_ids = enc.encode(correct_answer.strip())
     correct_tokens = [enc.decode([tid]) for tid in correct_token_ids]
+    vocab_size = getattr(enc, "n_vocab", 100277)
 
     if not correct_tokens:
         return 0.0, []
@@ -100,16 +95,19 @@ def teacher_force_correct_prob(client, model, messages_before_answer, correct_an
                 top_logprobs=TOP_LOGPROBS,
             )
 
-            found_prob = 0.0
-            if resp.choices[0].logprobs and resp.choices[0].logprobs.content:
-                for top_lp in resp.choices[0].logprobs.content[0].top_logprobs:
-                    if top_lp.token == target_token:
-                        found_prob = math.exp(top_lp.logprob)
-                        break
-            token_probs.append(found_prob)
+            if not (resp.choices[0].logprobs and resp.choices[0].logprobs.content):
+                raise ValueError("empty logprobs content")
+            dist = {}
+            mass = 0.0
+            for top_lp in resp.choices[0].logprobs.content[0].top_logprobs:
+                p = math.exp(top_lp.logprob)
+                dist[top_lp.token] = p
+                mass += p
+            token_probs.append(measures.completed_token_prob(dist, mass, target_token, vocab_size))
 
-        except Exception:
-            token_probs.append(0.0)
+        except Exception as e:
+            raise RuntimeError(
+                f"teacher forcing failed at token {len(token_probs)}: {e}") from e
 
         forced_prefix += target_token
 
@@ -118,25 +116,11 @@ def teacher_force_correct_prob(client, model, messages_before_answer, correct_an
 
 
 def judge_answer(correct_answer, given_answer):
+    """LLM equivalence judge; raises if the judge call fails."""
     if not given_answer or not given_answer.strip():
         return False
     from openai import OpenAI
-    judge_client = OpenAI()
-    prompt = JUDGE_TEMPLATE.format(
-        correct_answer=correct_answer,
-        given_answer=given_answer,
-    )
-    try:
-        resp = judge_client.chat.completions.create(
-            model=JUDGE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=5,
-        )
-        verdict = resp.choices[0].message.content.strip().lower()
-        return verdict.startswith("yes")
-    except Exception:
-        return False
+    return measures.judge_equivalent(OpenAI(), JUDGE_MODEL, correct_answer, given_answer)
 
 
 def load_completed_ids(output_path: Path) -> set:
@@ -146,7 +130,8 @@ def load_completed_ids(output_path: Path) -> set:
             for line in f:
                 try:
                     record = json.loads(line)
-                    completed.add(record["question_id"])
+                    if record.get("error") is None:
+                        completed.add(record["question_id"])
                 except json.JSONDecodeError:
                     continue
     return completed
@@ -201,8 +186,8 @@ def process_paraphrase(client, model, row, idx, output_path,
         split_pattern, steps = split_reasoning_into_steps(original_reasoning)
 
         if paraphrase_mode == "mask":
-            rng = random.Random(f"{seed}_{question_id}")
-            masker = TokenMasker(mask_ratio=mask_ratio, rng=rng, protect_latex=protect_latex)
+            rng = random.Random(f"{seed}_{question_id}_mask_p0")
+            masker = TokenMasker(mask_ratio=mask_ratio, rng=rng)
 
             mask_info = {}
             new_steps = []
@@ -233,6 +218,8 @@ def process_paraphrase(client, model, row, idx, output_path,
 
             paraphrased_reasoning = "\n\n".join(new_steps)
 
+        error = None
+        generated_answer = ""
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -264,10 +251,11 @@ def process_paraphrase(client, model, row, idx, output_path,
                 )
 
         except Exception as e:
-            generated_answer = ""
-            is_correct = False
-            correct_prob = 0.0
-            generated_prob = 0.0
+            print(f"[ERROR] {question_id}: {e}", flush=True)
+            error = str(e)
+            is_correct = None
+            correct_prob = None
+            generated_prob = None
 
         record = {
             "question_id": question_id,
@@ -290,7 +278,8 @@ def process_paraphrase(client, model, row, idx, output_path,
             "is_correct": is_correct,
             "generated_prob": generated_prob,
             "correct_prob": correct_prob,
-            "prob_delta": correct_prob - original_correct_prob,
+            "prob_delta": None if correct_prob is None else correct_prob - original_correct_prob,
+            "error": error,
         }
 
     except Exception as e:
@@ -315,10 +304,11 @@ def process_paraphrase(client, model, row, idx, output_path,
             "transformations_applied": {"error": str(e)},
             "paraphrased_reasoning": "",
             "generated_answer": "",
-            "is_correct": False,
-            "generated_prob": 0.0,
-            "correct_prob": 0.0,
-            "prob_delta": 0.0 - (cot_record.get("correct_prob") or 0.0),
+            "is_correct": None,
+            "generated_prob": None,
+            "correct_prob": None,
+            "prob_delta": None,
+            "error": str(e),
         }
 
     with write_lock:
@@ -363,6 +353,10 @@ def run_paraphrase_experiment(model, num_paraphrase, seed=42,
         output_dir = Path("results") / f"exp3_paraphrase_n{num_paraphrase}_math_{mtag}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "math.jsonl"
+    measures.write_run_config(
+        output_path, model=model, dataset="math", phase=mode_label, seed=seed,
+        mask_ratio=mask_ratio if paraphrase_mode == "mask" else None, n_probes=1,
+        top_logprobs=TOP_LOGPROBS, num_paraphrase=num_paraphrase, judge_model=JUDGE_MODEL)
 
     print("Loading MATH dataset...")
     dataset = load_dataset("qwedsacf/competition_math", split="train")
@@ -409,6 +403,7 @@ def run_paraphrase_experiment(model, num_paraphrase, seed=42,
 
 
 def main():
+    global TOP_LOGPROBS
     parser = argparse.ArgumentParser(description="Run paraphrase experiment on MATH CoT results")
     parser.add_argument("--model", type=str, default="gpt-4.1-nano")
     parser.add_argument("--provider", type=str, choices=["openai", "litellm", "vllm"], default="openai")
@@ -418,12 +413,13 @@ def main():
     parser.add_argument("--mask_ratio", type=float, default=0.1)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--no-protect-latex", action="store_true", default=False)
+    parser.add_argument("--top_logprobs", type=int, default=TOP_LOGPROBS,
+                        help="top-k log-probabilities requested per answer position")
     args = parser.parse_args()
 
-    global PROVIDER, TOP_LOGPROBS
+    global PROVIDER
     PROVIDER = args.provider
-    if args.provider == "litellm":
-        TOP_LOGPROBS = 5
+    TOP_LOGPROBS = args.top_logprobs
     if args.workers:
         global MAX_WORKERS
         MAX_WORKERS = args.workers

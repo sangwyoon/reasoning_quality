@@ -7,6 +7,7 @@ import math
 import re
 import random
 import argparse
+import sys
 import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,7 +16,9 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from llm_client import create_client, make_model_tag, get_tokenizer
-from paraphrase import split_reasoning_into_steps, TokenMasker
+from paraphrase import split_reasoning_into_steps, TokenMasker, remove_one_step
+
+import measures
 
 load_dotenv()
 
@@ -26,6 +29,7 @@ TOP_LOGPROBS = 200
 VOCAB_SIZE = 151936
 SEED = 42
 MASK_RATIO = 0.1
+JUDGE = None
 THINKING_MODEL = False
 DATA_PATH = "data/math_test.jsonl"
 
@@ -91,8 +95,9 @@ def vllm_detokenize(token_ids):
 
 def extract_distribution(logprobs_content):
     if not logprobs_content:
-        return {}, 0.0
-    dist, mass = {}, 0.0
+        raise ValueError("empty logprobs")
+    dist = {}
+    mass = 0.0
     for top_lp in logprobs_content[0].top_logprobs:
         p = math.exp(top_lp.logprob)
         dist[top_lp.token] = p
@@ -108,22 +113,8 @@ def kl_onehot(correct_token, dist, mass):
 
 
 def js_div(dist_p, mass_p, dist_q, mass_q):
-    all_tokens = set(dist_p.keys()) | set(dist_q.keys())
-    p_def = max(1e-10, 1.0 - mass_p) / max(1, VOCAB_SIZE - len(dist_p))
-    q_def = max(1e-10, 1.0 - mass_q) / max(1, VOCAB_SIZE - len(dist_q))
-    dist_m = {t: 0.5 * (dist_p.get(t, p_def) + dist_q.get(t, q_def)) for t in all_tokens}
-    mass_m = sum(dist_m.values())
-    m_def = max(1e-10, 1.0 - mass_m) / max(1, VOCAB_SIZE - len(dist_m))
-    kl_pm, kl_qm = 0.0, 0.0
-    for t in all_tokens:
-        pv = dist_p.get(t, p_def)
-        qv = dist_q.get(t, q_def)
-        mv = dist_m.get(t, m_def)
-        if pv > 0 and mv > 0:
-            kl_pm += pv * math.log(pv / mv)
-        if qv > 0 and mv > 0:
-            kl_qm += qv * math.log(qv / mv)
-    return max(0.5 * kl_pm + 0.5 * kl_qm, 0.0)
+    """Full JS over the vocabulary, including the residual-vocabulary term."""
+    return measures.js_open_ended(dist_p, mass_p, dist_q, mass_q, VOCAB_SIZE)
 
 
 IM_START = "<|im_start|>"
@@ -149,7 +140,7 @@ def teacher_force(client, messages, correct_answer):
         try:
             tids = vllm_tokenize(answer_text)
             tokens = vllm_detokenize(tids)
-        except:
+        except Exception:
             enc = get_tokenizer(MODEL)
             tids = enc.encode(answer_text)
             tokens = [enc.decode([t]) for t in tids]
@@ -170,14 +161,15 @@ def teacher_force(client, messages, correct_answer):
                     model=MODEL, prompt=raw, temperature=0,
                     max_tokens=1, logprobs=TOP_LOGPROBS)
                 if resp.choices[0].logprobs and resp.choices[0].logprobs.top_logprobs:
-                    d, mass = {}, 0.0
+                    d = {}
+                    mass = 0.0
                     for t_str, lp in resp.choices[0].logprobs.top_logprobs[0].items():
                         p = math.exp(lp)
                         d[t_str] = p
                         mass += p
                     d_out, m_out = d, mass
                 else:
-                    d_out, m_out = {}, 0.0
+                    raise ValueError("empty logprobs")
             else:
                 msgs = list(messages)
                 extra = {}
@@ -191,9 +183,9 @@ def teacher_force(client, messages, correct_answer):
                 if resp.choices[0].logprobs and resp.choices[0].logprobs.content:
                     d_out, m_out = extract_distribution(resp.choices[0].logprobs.content)
                 else:
-                    d_out, m_out = {}, 0.0
-        except:
-            d_out, m_out = {}, 0.0
+                    raise ValueError("empty logprobs")
+        except Exception as e:
+            raise RuntimeError(f"teacher_force failed at token {len(results)}: {e}") from e
         results.append((tok, d_out, m_out))
         prefix += tok
     return results
@@ -205,9 +197,10 @@ def compute_avg_token_prob(logprobs_content):
     return sum(math.exp(tok.logprob) for tok in logprobs_content) / len(logprobs_content)
 
 
-def apply_mask10(text, seed_str):
-    rng = random.Random(seed_str)
-    masker = TokenMasker(mask_ratio=MASK_RATIO, rng=rng, protect_latex=False)
+def apply_mask10(text, seed_str, probe_id=0):
+    """Mask the reasoning trace: each token independently with probability MASK_RATIO."""
+    rng = random.Random(f"{seed_str}_p{probe_id}")
+    masker = TokenMasker(mask_ratio=MASK_RATIO, rng=rng)
     masked, _, _ = masker.mask(text)
     return masked
 
@@ -223,27 +216,16 @@ def duplicate_step(reasoning, seed_str):
     return "\n\n".join(new_steps), idx
 
 
-def mask_one_step(reasoning, seed_str):
-    _, steps = split_reasoning_into_steps(reasoning)
-    if len(steps) < 2:
-        return reasoning, -1
-    rng = random.Random(seed_str)
-    idx = rng.randint(0, len(steps) - 1)
-    masker = TokenMasker(mask_ratio=1.0, rng=rng, protect_latex=False)
-    masked_step, _, _ = masker.mask(steps[idx])
-    new_steps = list(steps)
-    new_steps[idx] = masked_step
-    return "\n\n".join(new_steps), idx
-
-
 def load_completed_ids(output_path):
     completed = set()
     if output_path.exists():
         with open(output_path) as f:
             for line in f:
                 try:
-                    completed.add(json.loads(line)["question_id"])
-                except:
+                    record = json.loads(line)
+                    if record.get("error") is None:
+                        completed.add(record["question_id"])
+                except (json.JSONDecodeError, KeyError):
                     pass
     return completed
 
@@ -255,6 +237,7 @@ def process_cot(client, row, idx, output_path):
     problem = row["problem"]
     correct_answer = row.get("answer", extract_boxed_answer(row.get("solution", "")))
 
+    error = None
     try:
         prompt = COT_TEMPLATE.format(problem=problem)
         eb1 = _extra_body(enable_thinking=True)
@@ -272,7 +255,7 @@ def process_cot(client, row, idx, output_path):
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": reasoning},
                 {"role": "user", "content": ANSWER_FOLLOWUP},
-            ], temperature=0, max_tokens=256, logprobs=True, top_logprobs=5,
+            ], temperature=0, max_tokens=256, logprobs=True, top_logprobs=TOP_LOGPROBS,
             **({} if not _extra_body(False) else {"extra_body": _extra_body(False)}))
         generated_answer = resp2.choices[0].message.content.strip() if resp2.choices[0].message.content else ""
         generated_prob = compute_avg_token_prob(resp2.choices[0].logprobs.content) if resp2.choices[0].logprobs else 0.0
@@ -282,21 +265,31 @@ def process_cot(client, row, idx, output_path):
             {"role": "assistant", "content": reasoning},
             {"role": "user", "content": ANSWER_FOLLOWUP},
         ], correct_answer)
-        correct_prob = sum(d.get(t, 0) for t, d, m in tf_results) / len(tf_results) if tf_results else 0.0
-        is_correct = correct_answer.strip().lower() in generated_answer.lower() if correct_answer else False
+        if tf_results:
+            correct_prob = sum(measures.completed_token_prob(d, m, t, VOCAB_SIZE)
+                               for t, d, m in tf_results) / len(tf_results)
+            correct_tail_mass = sum(measures.tail_mass(m) for _, _, m in tf_results) / len(tf_results)
+        else:
+            correct_prob = None
+            correct_tail_mass = None
+        is_correct, is_correct_method = measures.match_answers(correct_answer, generated_answer, JUDGE)
 
     except Exception as e:
-        reasoning = f"ERROR: {str(e)}"
+        print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
+        error = str(e)
+        reasoning = f"ERROR: {error}"
         generated_answer = ""
-        generated_prob = 0.0
-        correct_prob = 0.0
-        is_correct = False
+        generated_prob = None
+        correct_prob = None
+        correct_tail_mass = None
+        is_correct = None
+        is_correct_method = None
 
     record = {
         "question_id": question_id, "type": row.get("type", ""), "level": row.get("level", ""),
         "ground_truth": correct_answer, "generated_answer": generated_answer,
-        "is_correct": is_correct, "generated_prob": generated_prob,
-        "correct_prob": correct_prob, "reasoning": reasoning,
+        "is_correct": is_correct, "is_correct_method": is_correct_method, "error": error, "generated_prob": generated_prob,
+        "correct_prob": correct_prob, "correct_tail_mass": correct_tail_mass, "reasoning": reasoning,
     }
     with write_lock:
         with open(output_path, "a") as f:
@@ -310,20 +303,40 @@ def process_direct(client, row, idx, output_path):
     question_id = f"math_{idx}"
     correct_answer = row.get("answer", extract_boxed_answer(row.get("solution", "")))
 
+    error = None
     try:
         prompt = DIRECT_TEMPLATE.format(problem=row["problem"])
         tf_results = teacher_force(client, [
             {"role": "user", "content": prompt},
         ], correct_answer)
-        kl_direct = sum(kl_onehot(t, d, m) for t, d, m in tf_results) / len(tf_results) if tf_results else -math.log(1e-10)
-    except:
-        kl_direct = -math.log(1e-10)
+        if not tf_results:
+            raise ValueError("no teacher-forcing tokens (empty gold answer?)")
+        kl_direct = sum(kl_onehot(t, d, m) for t, d, m in tf_results) / len(tf_results)
+    except Exception as e:
+        print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
+        error = str(e)
+        kl_direct = None
 
-    record = {"question_id": question_id, "kl_oh_direct": kl_direct}
+    record = {"question_id": question_id, "kl_oh_direct": kl_direct, "error": error}
     with write_lock:
         with open(output_path, "a") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     return record
+
+
+def write_error_record(output_path, question_id, correct_answer, exc, metric_keys):
+    """Report a failed item on stderr and store a record with ``error`` and empty metrics."""
+    print(f"[ERROR] {question_id}: {exc}", file=sys.stderr)
+    record = {"question_id": question_id, "ground_truth": correct_answer, "error": str(exc)}
+    record.update({k: None for k in metric_keys})
+    with write_lock:
+        with open(output_path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record
+
+
+KL_METRIC_KEYS = ("is_cot_correct", "kl_oh_cot", "kl_oh_cot_m", "js_cot_cotm", "kl_oh_dup",
+                  "kl_oh_dup_m", "js_dup_dupm", "kl_oh_sm", "kl_oh_sm_m", "js_sm_smm", "tail_mass")
 
 
 # ---- Phase 3: KL/JS ----
@@ -334,7 +347,7 @@ def process_kl(client, row, idx, output_path, cot_rec):
     if not correct_answer.strip():
         return None
     reasoning = cot_rec.get("reasoning", "")
-    if not reasoning or "ERROR" in reasoning:
+    if cot_rec.get("error") is not None or not reasoning:
         return None
 
     prompt = COT_TEMPLATE.format(problem=row["problem"])
@@ -342,19 +355,24 @@ def process_kl(client, row, idx, output_path, cot_rec):
 
     cot_orig = reasoning
     dup_orig, _ = duplicate_step(reasoning, seed_base)
-    sm_orig, _ = mask_one_step(reasoning, seed_base)
+    sm_orig, _ = remove_one_step(reasoning, seed_base)
     cot_m = apply_mask10(cot_orig, f"m10_{seed_base}_cot")
     dup_m = apply_mask10(dup_orig, f"m10_{seed_base}_dup")
-    sm_m = apply_mask10(sm_orig, f"m10_{seed_base}_sm")
 
-    conditions = {"cot": cot_orig, "cot_m": cot_m, "dup": dup_orig, "dup_m": dup_m, "sm": sm_orig, "sm_m": sm_m}
+    conditions = {"cot": cot_orig, "cot_m": cot_m, "dup": dup_orig, "dup_m": dup_m}
+    if sm_orig is not None:
+        conditions["sm"] = sm_orig
+        conditions["sm_m"] = apply_mask10(sm_orig, f"m10_{seed_base}_sm")
     tf = {}
-    for name, reas in conditions.items():
-        tf[name] = teacher_force(client, [
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": reas},
-            {"role": "user", "content": ANSWER_FOLLOWUP},
-        ], correct_answer)
+    try:
+        for name, reas in conditions.items():
+            tf[name] = teacher_force(client, [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": reas},
+                {"role": "user", "content": ANSWER_FOLLOWUP},
+            ], correct_answer)
+    except Exception as e:
+        return write_error_record(output_path, question_id, correct_answer, e, KL_METRIC_KEYS)
 
     min_tokens = min((len(r) for r in tf.values() if r), default=0)
     if min_tokens == 0:
@@ -374,7 +392,12 @@ def process_kl(client, row, idx, output_path, cot_rec):
 
     kl_c, kl_cm, js_c = compute("cot", "cot_m")
     kl_d, kl_dm, js_d = compute("dup", "dup_m")
-    kl_s, kl_sm, js_s = compute("sm", "sm_m")
+    if "sm" in tf:
+        kl_s, kl_sm, js_s = compute("sm", "sm_m")
+    else:
+        kl_s = kl_sm = js_s = None
+    tail_masses = {name: sum(measures.tail_mass(m) for _, _, m in res) / len(res)
+                   for name, res in tf.items() if res}
 
     record = {
         "question_id": question_id, "ground_truth": correct_answer,
@@ -382,6 +405,7 @@ def process_kl(client, row, idx, output_path, cot_rec):
         "kl_oh_cot": kl_c, "kl_oh_cot_m": kl_cm, "js_cot_cotm": js_c,
         "kl_oh_dup": kl_d, "kl_oh_dup_m": kl_dm, "js_dup_dupm": js_d,
         "kl_oh_sm": kl_s, "kl_oh_sm_m": kl_sm, "js_sm_smm": js_s,
+        "tail_mass": tail_masses,
     }
     with write_lock:
         with open(output_path, "a") as f:
@@ -397,6 +421,8 @@ def main():
     parser.add_argument("--phase", choices=["cot", "direct", "kl", "all"], default="all")
     parser.add_argument("--thinking-model", action="store_true")
     parser.add_argument("--top_logprobs", type=int, default=200)
+    parser.add_argument("--judge_model", type=str, default=None,
+                        help="OpenAI model used as an equivalence judge when exact/numeric match is undecided (default: no judge)")
     args = parser.parse_args()
 
     if args.model:
@@ -404,6 +430,10 @@ def main():
         MODEL = args.model
     global PROVIDER, THINKING_MODEL, TOP_LOGPROBS
     PROVIDER = args.provider
+    global JUDGE
+    if args.judge_model:
+        from openai import OpenAI
+        JUDGE = measures.make_judge(OpenAI(), args.judge_model)
     if args.workers:
         global MAX_WORKERS
         MAX_WORKERS = args.workers
@@ -421,6 +451,10 @@ def main():
         d = Path("results") / f"exp1_cot_math_{model_tag}"
         d.mkdir(parents=True, exist_ok=True)
         p = d / "math.jsonl"
+        measures.write_run_config(
+            p, model=MODEL, dataset="math", phase="cot", seed=SEED,
+            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS,
+            judge_model=args.judge_model)
         done = load_completed_ids(p)
         pending = [(i, r) for i, r in enumerate(data) if f"math_{i}" not in done]
         print(f"Phase 1: CoT (pending: {len(pending)}/{len(data)})")
@@ -434,6 +468,10 @@ def main():
         d = Path("results") / f"kl_direct_math_{model_tag}"
         d.mkdir(parents=True, exist_ok=True)
         p = d / "kl_direct.jsonl"
+        measures.write_run_config(
+            p, model=MODEL, dataset="math", phase="direct", seed=SEED,
+            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS,
+            judge_model=args.judge_model)
         done = load_completed_ids(p)
         pending = [(i, r) for i, r in enumerate(data) if f"math_{i}" not in done]
         print(f"Phase 2: Direct KL (pending: {len(pending)}/{len(data)})")
@@ -457,6 +495,10 @@ def main():
         d = Path("results") / f"kl_mask10_math_{model_tag}"
         d.mkdir(parents=True, exist_ok=True)
         p = d / "kl_mask10.jsonl"
+        measures.write_run_config(
+            p, model=MODEL, dataset="math", phase="kl", seed=SEED,
+            mask_ratio=MASK_RATIO, n_probes=1, top_logprobs=TOP_LOGPROBS,
+            judge_model=args.judge_model)
         done = load_completed_ids(p)
         pending = [(i, r, cot_map[f"math_{i}"]) for i, r in enumerate(data)
                     if f"math_{i}" not in done and f"math_{i}" in cot_map]
@@ -476,9 +518,12 @@ def main():
             print(f"Results (model: {MODEL}, n={n}, MATH)")
             print(f"{'='*70}")
             for label, oh, ohm, js in [("CoT","kl_oh_cot","kl_oh_cot_m","js_cot_cotm"),("Dup","kl_oh_dup","kl_oh_dup_m","js_dup_dupm"),("SM","kl_oh_sm","kl_oh_sm_m","js_sm_smm")]:
-                o = sum(r[oh] for r in records)/n
-                m = sum(r[ohm] for r in records)/n
-                j = sum(r[js] for r in records)/n
+                rs = [r for r in records if r[oh] is not None]
+                if not rs:
+                    continue
+                o = sum(r[oh] for r in rs) / len(rs)
+                m = sum(r[ohm] for r in rs) / len(rs)
+                j = sum(r[js] for r in rs) / len(rs)
                 print(f"  {label:<4}: KL(orig)={o:.4f}  KL(masked)={m:.4f}  D={m-o:+.4f}  JS={j:.4f}")
 
 

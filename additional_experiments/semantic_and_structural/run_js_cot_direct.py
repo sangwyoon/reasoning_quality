@@ -1,4 +1,5 @@
 
+import sys
 import json
 import math
 import re
@@ -11,6 +12,7 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 from llm_client import create_client, make_model_tag
+import measures
 
 load_dotenv()
 
@@ -65,9 +67,11 @@ def load_completed_ids(output_path: Path) -> set:
         with open(output_path) as f:
             for line in f:
                 try:
-                    completed.add(json.loads(line)["question_id"])
-                except:
-                    pass
+                    record = json.loads(line)
+                    if record.get("error") is None:
+                        completed.add(record["question_id"])
+                except (json.JSONDecodeError, KeyError):
+                    continue
     return completed
 
 
@@ -118,28 +122,8 @@ def kl_onehot(correct_token, dist, mass):
 
 
 def js_div(dist_p, mass_p, dist_q, mass_q):
-    all_tokens = set(dist_p.keys()) | set(dist_q.keys())
-    p_def = max(1e-10, 1.0 - mass_p) / max(1, VOCAB_SIZE - len(dist_p))
-    q_def = max(1e-10, 1.0 - mass_q) / max(1, VOCAB_SIZE - len(dist_q))
-
-    dist_m = {}
-    for t in all_tokens:
-        dist_m[t] = 0.5 * (dist_p.get(t, p_def) + dist_q.get(t, q_def))
-    mass_m = sum(dist_m.values())
-
-    m_def = max(1e-10, 1.0 - mass_m) / max(1, VOCAB_SIZE - len(dist_m))
-
-    kl_pm, kl_qm = 0.0, 0.0
-    for t in all_tokens:
-        pv = dist_p.get(t, p_def)
-        qv = dist_q.get(t, q_def)
-        mv = dist_m.get(t, m_def)
-        if pv > 0 and mv > 0:
-            kl_pm += pv * math.log(pv / mv)
-        if qv > 0 and mv > 0:
-            kl_qm += qv * math.log(qv / mv)
-
-    return max(0.5 * kl_pm + 0.5 * kl_qm, 0.0)
+    """Full JS over the vocabulary, including the residual-vocabulary term."""
+    return measures.js_open_ended(dist_p, mass_p, dist_q, mass_q, VOCAB_SIZE)
 
 
 def teacher_force(client, messages, correct_answer):
@@ -150,7 +134,7 @@ def teacher_force(client, messages, correct_answer):
         try:
             tids = vllm_tokenize(answer_text)
             tokens = vllm_detokenize(tids)
-        except:
+        except Exception:
             from llm_client import get_tokenizer
             enc = get_tokenizer(MODEL)
             tids = enc.encode(answer_text)
@@ -176,18 +160,36 @@ def teacher_force(client, messages, correct_answer):
             resp = client.chat.completions.create(
                 model=MODEL, messages=msgs, temperature=0,
                 max_tokens=1, logprobs=True, top_logprobs=TOP_LOGPROBS, **extra)
-            if resp.choices[0].logprobs and resp.choices[0].logprobs.content:
-                d, m = extract_distribution(resp.choices[0].logprobs.content)
-            else:
-                d, m = {}, 0.0
-        except:
-            d, m = {}, 0.0
+            if not (resp.choices[0].logprobs and resp.choices[0].logprobs.content):
+                raise ValueError("empty logprobs content")
+            d, m = extract_distribution(resp.choices[0].logprobs.content)
+        except Exception as e:
+            raise RuntimeError(f"teacher forcing failed at token {len(results)}: {e}") from e
         results.append((tok, d, m))
         prefix += tok
     return results
 
 
+ITEM_METRIC_KEYS = ('n_tokens', 'js_cot_direct', 'kl_onehot_cot', 'kl_onehot_direct', 'js_cot_direct_per_token', 'kl_onehot_cot_per_token', 'kl_onehot_direct_per_token', 'tail_mass', 'is_cot_correct',)
+
+
 def process_item(client, row, idx, output_path, cot_rec):
+    """Compute and store one item; a failure is reported and stored as an ``error`` record."""
+    try:
+        return _compute_item(client, row, idx, output_path, cot_rec)
+    except Exception as e:
+        question_id = f"math_t_{idx}"
+        print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
+        record = {"question_id": question_id, "type": row.get("type", ""),
+                  "ground_truth": extract_boxed_answer(row["solution"]), "error": str(e)}
+        record.update({k: None for k in ITEM_METRIC_KEYS})
+        with write_lock:
+            with open(output_path, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record
+
+
+def _compute_item(client, row, idx, output_path, cot_rec):
     question_id = f"math_t_{idx}"
     problem = row["problem"]
     correct_answer = extract_boxed_answer(row["solution"])
@@ -195,7 +197,7 @@ def process_item(client, row, idx, output_path, cot_rec):
         return None
 
     reasoning = cot_rec.get("reasoning", "")
-    if not reasoning or "ERROR" in reasoning:
+    if cot_rec.get("error") is not None or not reasoning:
         return None
 
     # CoT condition
@@ -241,6 +243,7 @@ def process_item(client, row, idx, output_path, cot_rec):
         "js_cot_direct_per_token": js_per_token,
         "kl_onehot_cot_per_token": kl_oh_cot_per_token,
         "kl_onehot_direct_per_token": kl_oh_dir_per_token,
+        "tail_mass": {"cot": measures.mean_tail_mass(cot_res), "direct": measures.mean_tail_mass(direct_res)},
     }
 
     with write_lock:
@@ -279,6 +282,9 @@ def main():
     output_dir = Path("results") / f"js_cot_direct_math_t_{model_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "js_results.jsonl"
+    measures.write_run_config(
+        output_path, model=MODEL, dataset="math_test", phase="js_results", seed=None,
+        mask_ratio=None, n_probes=1, top_logprobs=TOP_LOGPROBS)
 
     data = load_data()
     completed = load_completed_ids(output_path)
@@ -307,7 +313,9 @@ def main():
     records = []
     with open(output_path) as f:
         for line in f:
-            records.append(json.loads(line))
+            r = json.loads(line)
+            if r.get("error") is None:
+                records.append(r)
     if records:
         n = len(records)
         correct = [r for r in records if r["is_cot_correct"]]

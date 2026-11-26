@@ -5,6 +5,7 @@ import math
 import os
 import random
 import argparse
+import sys
 import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +15,8 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from llm_client import create_client, make_model_tag
+
+import measures
 
 load_dotenv()
 
@@ -65,22 +68,15 @@ def shuffle_choices(row, rng):
     return choices, correct_label
 
 
+ANSWER_LABELS = ("A", "B", "C", "D")
+
+
 def extract_answer_probs(logprobs_content):
-    probs = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
-    seen = set()
-    predicted = None
+    """Return (probs, predicted, info); ValueError if no A-D token is observed.
 
-    if logprobs_content:
-        first_token = logprobs_content[0]
-        predicted = first_token.token.strip()
-
-        for top_lp in first_token.top_logprobs:
-            token = top_lp.token.strip().rstrip(".")
-            if token in probs and token not in seen:
-                probs[token] = math.exp(top_lp.logprob)
-                seen.add(token)
-
-    return probs, predicted
+    Choices missing from the top-k get a tail-mass fill (see measures.py).
+    """
+    return measures.extract_choice_probs(logprobs_content, ANSWER_LABELS)
 
 
 def load_completed_ids(output_path: Path) -> set:
@@ -90,7 +86,8 @@ def load_completed_ids(output_path: Path) -> set:
             for line in f:
                 try:
                     record = json.loads(line)
-                    completed.add(record["question_id"])
+                    if record.get("error") is None:
+                        completed.add(record["question_id"])
                 except json.JSONDecodeError:
                     continue
     return completed
@@ -112,6 +109,8 @@ def process_cot(client, row, idx, output_path, choices, ground_truth):
     question_id = f"gpqa_{idx}"
     prompt = build_prompt(row, COT_TEMPLATE, choices)
 
+    error = None
+    mc_info = {}
     try:
         resp1 = client.chat.completions.create(
             model=MODEL,
@@ -131,17 +130,19 @@ def process_cot(client, row, idx, output_path, choices, ground_truth):
             temperature=0,
             max_tokens=1,
             logprobs=True,
-            top_logprobs=5,
+            top_logprobs=measures.MC_TOP_LOGPROBS,
         )
 
-        probs, predicted = extract_answer_probs(resp2.choices[0].logprobs.content)
+        probs, predicted, mc_info = extract_answer_probs(resp2.choices[0].logprobs.content)
         correct_prob = probs.get(ground_truth, 0.0)
 
     except Exception as e:
-        reasoning = f"ERROR: {str(e)}"
-        probs = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+        print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
+        error = str(e)
+        reasoning = f"ERROR: {error}"
+        probs = None
         predicted = None
-        correct_prob = 0.0
+        correct_prob = None
 
     record = {
         "question_id": question_id,
@@ -151,6 +152,9 @@ def process_cot(client, row, idx, output_path, choices, ground_truth):
         "predicted": predicted,
         "correct_token_prob": correct_prob,
         "top_probs": probs,
+        "choice_mass_observed": mc_info.get("choice_mass_observed"),
+        "n_choices_missing": mc_info.get("n_missing"),
+        "error": error,
         "reasoning": reasoning,
     }
 
@@ -165,6 +169,8 @@ def process_direct(client, row, idx, output_path, choices, ground_truth):
     question_id = f"gpqa_{idx}"
     prompt = build_prompt(row, DIRECT_TEMPLATE, choices)
 
+    error = None
+    mc_info = {}
     try:
         resp = client.chat.completions.create(
             model=MODEL,
@@ -172,16 +178,18 @@ def process_direct(client, row, idx, output_path, choices, ground_truth):
             temperature=0,
             max_tokens=1,
             logprobs=True,
-            top_logprobs=5,
+            top_logprobs=measures.MC_TOP_LOGPROBS,
         )
 
-        probs, predicted = extract_answer_probs(resp.choices[0].logprobs.content)
+        probs, predicted, mc_info = extract_answer_probs(resp.choices[0].logprobs.content)
         correct_prob = probs.get(ground_truth, 0.0)
 
     except Exception as e:
-        probs = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+        print(f"[ERROR] {question_id}: {e}", file=sys.stderr)
+        error = str(e)
+        probs = None
         predicted = None
-        correct_prob = 0.0
+        correct_prob = None
 
     record = {
         "question_id": question_id,
@@ -191,6 +199,9 @@ def process_direct(client, row, idx, output_path, choices, ground_truth):
         "predicted": predicted,
         "correct_token_prob": correct_prob,
         "top_probs": probs,
+        "choice_mass_observed": mc_info.get("choice_mass_observed"),
+        "n_choices_missing": mc_info.get("n_missing"),
+        "error": error,
     }
 
     with write_lock:
@@ -207,6 +218,9 @@ def run_experiment(exp_name):
     output_dir = Path("results") / f"{exp_name}_gpqa_{model_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "gpqa.jsonl"
+    measures.write_run_config(
+        output_path, model=MODEL, dataset="gpqa", phase=exp_name, seed=42,
+        mask_ratio=None, n_probes=None, top_logprobs=measures.MC_TOP_LOGPROBS)
 
     print("Loading GPQA dataset...")
     dataset = load_dataset("Idavidrein/gpqa", "gpqa_main", split="train",
@@ -260,7 +274,10 @@ def main():
     parser.add_argument("--provider", type=str, choices=["openai", "litellm", "vllm"], default="openai")
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--hf_token", type=str, default=None)
+    parser.add_argument("--top_logprobs", type=int, default=measures.MC_TOP_LOGPROBS,
+                        help="top-k log-probabilities requested per answer position")
     args = parser.parse_args()
+    measures.MC_TOP_LOGPROBS = args.top_logprobs
 
     if args.model:
         global MODEL
